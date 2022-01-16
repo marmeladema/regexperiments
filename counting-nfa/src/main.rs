@@ -429,11 +429,9 @@ impl<'a> Matcher<'a> {
 
     #[inline]
     fn addstate(&mut self, idx: usize) {
-        println!(
-            "[addstate] idx = {}, lastid = {}, lastlist = {:?}",
-            idx, self.listid, self.lastlist
-        );
+        println!("[addstate] idx = {}, lastid = {}", idx, self.listid);
         if self.lastlist[idx] == self.listid {
+            println!("[addstate] skipping");
             return;
         }
         self.lastlist[idx] = self.listid;
@@ -444,6 +442,7 @@ impl<'a> Matcher<'a> {
             }
             State::Counter { out, counter } => {
                 self.addcounter(counter);
+                self.lastlist[out] = usize::MAX;
                 self.addstate(out);
             }
             State::Repeat {
@@ -457,7 +456,7 @@ impl<'a> Matcher<'a> {
                 self.lastlist[idx] = self.listid;
                 let count = self.counters[counter].value - 1;
                 let single = self.counters[counter].next == usize::MAX;
-                println!("count = {}, single = {}", count, single);
+                println!("start = {}, count = {}, single = {}", start, count, single);
                 if count != start || !single {
                     // `count != start` <=> all instances of the counter are different from `start`
                     // `!single` <=> at least one other instance of the counter is different from `start`
@@ -506,7 +505,7 @@ impl<'a> Matcher<'a> {
 
     /// Check whether state list contains a match.
     pub fn ismatch(&self) -> bool {
-        println!("list = {:?}, repetitions = {:?}", self.clist, self.counters);
+        println!("list = {:?}, counters = {:?}", self.clist, self.counters);
         for &idx in self.clist.iter() {
             if matches!(self.states[idx], State::Match) {
                 return true;
@@ -594,5 +593,87 @@ pub(crate) mod tests {
         let mut matcher = memory.matcher(&regex);
         matcher.chunk(input);
         assert!(matcher.ismatch());
+    }
+
+    #[test]
+    fn test_nested_counting() {
+        let mut builder = RegexBuilder::default();
+        let mut memory = MatcherMemory::default();
+
+        let ast = RegexAst::Repetition {
+            node: Box::new(RegexAst::Alternate(vec![
+                RegexAst::Catenate(vec![RegexAst::Char('a')]),
+                RegexAst::Catenate(vec![RegexAst::Char('b'), RegexAst::Char('c')]),
+            ])),
+            range: 1..3,
+        };
+        println!("pattern: {}", ast);
+
+        let regex = builder.build(&ast);
+        println!("regex: {:#?}", regex);
+
+        let input = "a";
+        let mut matcher = memory.matcher(&regex);
+        matcher.chunk(input);
+        assert!(matcher.ismatch());
+
+        let input = "bc";
+        let mut matcher = memory.matcher(&regex);
+        matcher.chunk(input);
+        assert!(matcher.ismatch());
+
+        let input = "aa";
+        let mut matcher = memory.matcher(&regex);
+        matcher.chunk(input);
+        assert!(!matcher.ismatch());
+
+        let input = "bcbc";
+        let mut matcher = memory.matcher(&regex);
+        matcher.chunk(input);
+        assert!(!matcher.ismatch());
+
+        let ast = RegexAst::Repetition {
+            node: Box::new(ast),
+            range: 2..2,
+        };
+        println!("pattern: {}", ast);
+
+        let regex = builder.build(&ast);
+        println!("regex: {:#?}", regex);
+
+        let input = "a";
+        let mut matcher = memory.matcher(&regex);
+        matcher.chunk(input);
+        assert!(!matcher.ismatch());
+
+        let input = "aa";
+        let mut matcher = memory.matcher(&regex);
+        matcher.chunk(input);
+        assert!(matcher.ismatch());
+
+        let input = "bcbc";
+        let mut matcher = memory.matcher(&regex);
+        matcher.chunk(input);
+        assert!(matcher.ismatch());
+
+        let input = "abc";
+        let mut matcher = memory.matcher(&regex);
+        matcher.chunk(input);
+        assert!(matcher.ismatch());
+
+        let input = "bca";
+        let mut matcher = memory.matcher(&regex);
+        matcher.chunk(input);
+        assert!(matcher.ismatch());
+
+        let input = "aaa";
+        let mut matcher = memory.matcher(&regex);
+        matcher.chunk(input);
+        assert!(!matcher.ismatch());
+
+        let input = "bcaa";
+        let mut matcher = memory.matcher(&regex);
+        matcher.chunk(input);
+        assert!(!matcher.ismatch());
     }
 }
