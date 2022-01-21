@@ -1,16 +1,12 @@
 /// Based on Russ Cox's article from https://swtch.com/~rsc/regexp/regexp1.html
 /// with additional support for counting constraints from https://www.arl.wustl.edu/~pcrowley/a25-becchi.pdf
 use std::fmt;
-use std::ops::Range;
 
 #[derive(Debug)]
 enum RegexAst {
     Catenate(Vec<RegexAst>),
     Alternate(Vec<RegexAst>),
-    Repetition {
-        node: Box<RegexAst>,
-        range: Range<usize>,
-    },
+    Repetition { node: Box<RegexAst>, count: usize },
     Char(char),
     Wildcard,
     Star(Box<RegexAst>),
@@ -35,14 +31,14 @@ impl fmt::Display for RegexAst {
                 }
                 Ok(())
             }
-            Self::Repetition { node, range } => {
+            Self::Repetition { node, count } => {
                 if matches!(
                     **node,
                     RegexAst::Catenate { .. } | RegexAst::Alternate { .. }
                 ) {
-                    write!(f, "({}){{{},{}}}", node, range.start, range.end)
+                    write!(f, "({}){{{}}}", node, count)
                 } else {
-                    write!(f, "{}{{{},{}}}", node, range.start, range.end)
+                    write!(f, "{}{{{}}}", node, count)
                 }
             }
             Self::Char(c) => write!(f, "{}", c),
@@ -75,8 +71,7 @@ enum State {
         counter: usize,
         out: usize,
         out1: usize,
-        start: usize,
-        end: usize,
+        count: usize,
     },
     Char {
         char: char,
@@ -246,14 +241,13 @@ impl RegexBuilder {
                 let mut nodes = items.iter();
                 self.next_alternate(nodes.next().unwrap(), nodes)
             }
-            RegexAst::Repetition { node, range } => {
+            RegexAst::Repetition { node, count } => {
                 let e = self.next_fragment(node);
                 let s = self.push(State::Repeat {
                     counter: self.counters,
                     out: e.start,
                     out1: INVALID_INDEX,
-                    start: range.start,
-                    end: range.end,
+                    count: *count,
                 });
                 self.patch(e.out, s);
                 let k = self.push(State::Counter {
@@ -448,21 +442,21 @@ impl<'a> Matcher<'a> {
             State::Repeat {
                 out,
                 out1,
-                start,
+                count,
                 counter,
                 ..
             } => {
                 self.inccounter(counter);
                 self.lastlist[idx] = self.listid;
-                let count = self.counters[counter].value - 1;
+                let value = self.counters[counter].value - 1;
                 let single = self.counters[counter].next == usize::MAX;
-                println!("start = {}, count = {}, single = {}", start, count, single);
-                if count != start || !single {
-                    // `count != start` <=> all instances of the counter are different from `start`
-                    // `!single` <=> at least one other instance of the counter is different from `start`
+                println!("count = {}, value = {}, single = {}", count, value, single);
+                if value != count || !single {
+                    // `value != count` <=> all instances of the counter are different from `count`
+                    // `!single` <=> at least one other instance of the counter is different from `count`
                     self.addstate(out);
                 }
-                if count == start {
+                if value == count {
                     // The oldest instance of the counter is equal to `start`
                     self.delcounter(counter);
                     self.addstate(out1);
@@ -528,7 +522,7 @@ fn main() {
             RegexAst::Catenate(vec![RegexAst::Char('a')]),
             RegexAst::Catenate(vec![RegexAst::Char('b'), RegexAst::Char('c')]),
         ])),
-        range: 1..3,
+        count: 1,
     };
     println!("pattern: {}", ast);
 
@@ -545,7 +539,7 @@ fn main() {
 
     let ast = RegexAst::Repetition {
         node: Box::new(ast),
-        range: 2..2,
+        count: 2,
     };
     println!("pattern: {}", ast);
 
@@ -571,7 +565,7 @@ pub(crate) mod tests {
             RegexAst::Char('a'),
             RegexAst::Repetition {
                 node: Box::new(RegexAst::Wildcard),
-                range: 3..3,
+                count: 3,
             },
             RegexAst::Char('b'),
             RegexAst::Char('c'),
@@ -597,6 +591,8 @@ pub(crate) mod tests {
 
     #[test]
     fn test_nested_counting() {
+        use itertools::Itertools;
+
         let mut builder = RegexBuilder::default();
         let mut memory = MatcherMemory::default();
 
@@ -605,75 +601,100 @@ pub(crate) mod tests {
                 RegexAst::Catenate(vec![RegexAst::Char('a')]),
                 RegexAst::Catenate(vec![RegexAst::Char('b'), RegexAst::Char('c')]),
             ])),
-            range: 1..3,
+            count: 2,
         };
         println!("pattern: {}", ast);
 
         let regex = builder.build(&ast);
         println!("regex: {:#?}", regex);
 
+        let mut matcher = memory.matcher(&regex);
+        matcher.chunk("");
+        assert!(!matcher.ismatch());
+
         let input = "a";
         let mut matcher = memory.matcher(&regex);
         matcher.chunk(input);
-        assert!(matcher.ismatch());
+        assert!(!matcher.ismatch());
 
         let input = "bc";
         let mut matcher = memory.matcher(&regex);
         matcher.chunk(input);
-        assert!(matcher.ismatch());
-
-        let input = "aa";
-        let mut matcher = memory.matcher(&regex);
-        matcher.chunk(input);
         assert!(!matcher.ismatch());
 
-        let input = "bcbc";
-        let mut matcher = memory.matcher(&regex);
-        matcher.chunk(input);
-        assert!(!matcher.ismatch());
+        for v in std::iter::repeat(["a", "bc"])
+            .take(2)
+            .map(|a| a.into_iter())
+            .multi_cartesian_product()
+        {
+            let input = v.into_iter().collect::<String>();
+            println!("input = {:?}", input);
+            let mut matcher = memory.matcher(&regex);
+            matcher.chunk(&input);
+            assert!(matcher.ismatch());
+        }
+
+        for v in std::iter::repeat(["a", "bc"])
+            .take(3)
+            .map(|a| a.into_iter())
+            .multi_cartesian_product()
+        {
+            let input = v.into_iter().collect::<String>();
+            println!("input = {:?}", input);
+            let mut matcher = memory.matcher(&regex);
+            matcher.chunk(&input);
+            assert!(!matcher.ismatch());
+        }
 
         let ast = RegexAst::Repetition {
             node: Box::new(ast),
-            range: 2..2,
+            count: 3,
         };
         println!("pattern: {}", ast);
 
         let regex = builder.build(&ast);
         println!("regex: {:#?}", regex);
 
-        let input = "a";
         let mut matcher = memory.matcher(&regex);
-        matcher.chunk(input);
+        matcher.chunk("");
         assert!(!matcher.ismatch());
 
-        let input = "aa";
-        let mut matcher = memory.matcher(&regex);
-        matcher.chunk(input);
-        assert!(matcher.ismatch());
+        for i in 0..6 {
+            for v in std::iter::repeat(["a", "bc"])
+                .take(i)
+                .map(|a| a.into_iter())
+                .multi_cartesian_product()
+            {
+                let input = v.into_iter().collect::<String>();
+                println!("input = {:?}", input);
+                let mut matcher = memory.matcher(&regex);
+                matcher.chunk(&input);
+                assert!(!matcher.ismatch());
+            }
+        }
 
-        let input = "bcbc";
-        let mut matcher = memory.matcher(&regex);
-        matcher.chunk(input);
-        assert!(matcher.ismatch());
+        for v in std::iter::repeat(["a", "bc"])
+            .take(6)
+            .map(|a| a.into_iter())
+            .multi_cartesian_product()
+        {
+            let input = v.into_iter().collect::<String>();
+            println!("input = {:?}", input);
+            let mut matcher = memory.matcher(&regex);
+            matcher.chunk(&input);
+            assert!(matcher.ismatch());
+        }
 
-        let input = "abc";
-        let mut matcher = memory.matcher(&regex);
-        matcher.chunk(input);
-        assert!(matcher.ismatch());
-
-        let input = "bca";
-        let mut matcher = memory.matcher(&regex);
-        matcher.chunk(input);
-        assert!(matcher.ismatch());
-
-        let input = "aaa";
-        let mut matcher = memory.matcher(&regex);
-        matcher.chunk(input);
-        assert!(!matcher.ismatch());
-
-        let input = "bcaa";
-        let mut matcher = memory.matcher(&regex);
-        matcher.chunk(input);
-        assert!(!matcher.ismatch());
+        for v in std::iter::repeat(["a", "bc"])
+            .take(7)
+            .map(|a| a.into_iter())
+            .multi_cartesian_product()
+        {
+            let input = v.into_iter().collect::<String>();
+            println!("input = {:?}", input);
+            let mut matcher = memory.matcher(&regex);
+            matcher.chunk(&input);
+            assert!(!matcher.ismatch());
+        }
     }
 }
