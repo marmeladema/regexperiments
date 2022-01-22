@@ -1,5 +1,7 @@
-/// Based on Russ Cox's article from https://swtch.com/~rsc/regexp/regexp1.html
-/// with additional support for counting constraints from https://www.arl.wustl.edu/~pcrowley/a25-becchi.pdf
+//! Based on Russ Cox's article from https://swtch.com/~rsc/regexp/regexp1.html
+//! with additional support for counting constraints from https://www.arl.wustl.edu/~pcrowley/a25-becchi.pdf
+
+use std::collections::VecDeque;
 use std::fmt;
 
 #[derive(Debug)]
@@ -299,8 +301,7 @@ impl RegexBuilder {
 #[derive(Debug, Default)]
 struct MatcherMemory {
     lastlist: Vec<usize>,
-    counters: Vec<Counter>,
-    deltas: Vec<CounterDelta>,
+    counters: Vec<Option<Counter>>,
     clist: Vec<usize>,
     nlist: Vec<usize>,
 }
@@ -310,13 +311,11 @@ impl MatcherMemory {
         self.lastlist.clear();
         self.lastlist.resize(regex.states.len(), usize::MAX);
         self.counters.clear();
-        self.counters.resize(regex.counters, Counter::default());
+        self.counters.resize(regex.counters, None);
         self.clist.clear();
         self.nlist.clear();
-        self.deltas.clear();
 
         let mut m = Matcher {
-            deltas: &mut self.deltas,
             counters: &mut self.counters,
             states: &regex.states,
             lastlist: &mut self.lastlist,
@@ -331,12 +330,11 @@ impl MatcherMemory {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Counter {
     value: usize,
     delta: usize,
-    next: usize,
-    end: usize,
+    deltas: VecDeque<usize>,
 }
 
 impl Default for Counter {
@@ -344,22 +342,13 @@ impl Default for Counter {
         Self {
             value: 0,
             delta: 0,
-            next: usize::MAX,
-            end: usize::MAX,
+            deltas: VecDeque::default(),
         }
     }
 }
-
-#[derive(Debug)]
-struct CounterDelta {
-    delta: usize,
-    next: usize,
-}
-
 #[derive(Debug)]
 struct Matcher<'a> {
-    deltas: &'a mut Vec<CounterDelta>,
-    counters: &'a mut [Counter],
+    counters: &'a mut [Option<Counter>],
     states: &'a [State],
     lastlist: &'a mut [usize],
     listid: usize,
@@ -377,47 +366,40 @@ impl<'a> Matcher<'a> {
     }
 
     fn addcounter(&mut self, idx: usize) {
-        println!("ADDING COUNTER FOR {}", idx);
-        let counter = &mut self.counters[idx];
-        if counter.value != 0 {
-            let end = self.deltas.len();
-            self.deltas.push(CounterDelta {
-                delta: counter.delta,
-                next: usize::MAX,
-            });
+        println!(
+            "ADDING INSTANCE FOR COUNTER {} = {:#?}",
+            idx, self.counters[idx]
+        );
+        if let Some(counter) = self.counters[idx].as_mut() {
+            counter.deltas.push_back(counter.delta);
             counter.delta = 0;
-            if counter.next == usize::MAX {
-                counter.next = end;
-            }
-            if counter.end != usize::MAX {
-                self.deltas[counter.end].next = end;
-            }
-            counter.end = end;
+        } else {
+            self.counters[idx] = Some(Counter::default());
         }
     }
 
     fn inccounter(&mut self, idx: usize) {
-        println!("INCREMENTING COUNTER FOR {}", idx);
-        let counter = &mut self.counters[idx];
+        println!(
+            "INCREMENTING VALUE FOR COUNTER {} = {:#?}",
+            idx, self.counters[idx]
+        );
+        let counter = self.counters[idx].as_mut().unwrap();
         counter.value += 1;
         counter.delta += 1;
     }
 
     fn delcounter(&mut self, idx: usize) {
-        println!("DELETING COUNTER FOR {}", idx);
-        let counter = &mut self.counters[idx];
+        println!(
+            "DELETING INSTANCE FOR COUNTER {} = {:#?}",
+            idx, self.counters[idx]
+        );
+        let counter = self.counters[idx].as_mut().unwrap();
         assert!(counter.value > 0);
-        if counter.next != usize::MAX {
-            let next = &self.deltas[counter.next];
-            println!("next: {:?}", next);
-            counter.value -= next.delta;
-            counter.next = next.next;
-            if counter.next == usize::MAX {
-                counter.end = usize::MAX;
-            }
+        if let Some(delta) = counter.deltas.pop_front() {
+            assert!(delta < counter.value);
+            counter.value -= delta;
         } else {
-            counter.value = 0;
-            counter.delta = 0;
+            self.counters[idx] = None;
         }
     }
 
@@ -448,9 +430,12 @@ impl<'a> Matcher<'a> {
             } => {
                 self.inccounter(counter);
                 self.lastlist[idx] = self.listid;
-                let value = self.counters[counter].value - 1;
-                let single = self.counters[counter].next == usize::MAX;
-                println!("count = {}, value = {}, single = {}", count, value, single);
+                let value = self.counters[counter].as_ref().unwrap().value - 1;
+                let single = self.counters[counter].as_ref().unwrap().deltas.is_empty();
+                println!(
+                    "[addstate:repeat] count = {}, value = {}, single = {}",
+                    count, value, single
+                );
                 if value != count || !single {
                     // `value != count` <=> all instances of the counter are different from `count`
                     // `!single` <=> at least one other instance of the counter is different from `count`
@@ -555,6 +540,7 @@ fn main() {
     }
 }
 
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
 
