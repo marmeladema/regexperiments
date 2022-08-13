@@ -11,7 +11,9 @@ enum RegexAst {
     Repetition { node: Box<RegexAst>, count: usize },
     Char(char),
     Wildcard,
-    Star(Box<RegexAst>),
+    ZeroPlus(Box<RegexAst>),
+    OnePlus(Box<RegexAst>),
+    ZeroOne(Box<RegexAst>),
 }
 
 impl fmt::Display for RegexAst {
@@ -45,7 +47,7 @@ impl fmt::Display for RegexAst {
             }
             Self::Char(c) => write!(f, "{}", c),
             Self::Wildcard => write!(f, "."),
-            Self::Star(node) => {
+            Self::ZeroPlus(node) => {
                 if matches!(
                     **node,
                     RegexAst::Catenate { .. } | RegexAst::Alternate { .. }
@@ -53,6 +55,26 @@ impl fmt::Display for RegexAst {
                     write!(f, "({})*", node)
                 } else {
                     write!(f, "{}*", node)
+                }
+            }
+            Self::OnePlus(node) => {
+                if matches!(
+                    **node,
+                    RegexAst::Catenate { .. } | RegexAst::Alternate { .. }
+                ) {
+                    write!(f, "({})+", node)
+                } else {
+                    write!(f, "{}+", node)
+                }
+            }
+            Self::ZeroOne(node) => {
+                if matches!(
+                    **node,
+                    RegexAst::Catenate { .. } | RegexAst::Alternate { .. }
+                ) {
+                    write!(f, "({})?", node)
+                } else {
+                    write!(f, "{}?", node)
                 }
             }
         }
@@ -65,11 +87,13 @@ enum State {
         out: usize,
         out1: usize,
     },
-    Counter {
+    // Creates a new counter instance
+    CounterInstance {
         counter: usize,
         out: usize,
     },
-    Repeat {
+    // Increments all instances of a counter
+    CounterIncrement {
         counter: usize,
         out: usize,
         out1: usize,
@@ -82,6 +106,9 @@ enum State {
     Wildcard {
         out: usize,
     },
+    Noop {
+        out: usize,
+    },
     Match,
 }
 
@@ -91,8 +118,9 @@ impl State {
             State::Char { out, .. } => out,
             State::Wildcard { out, .. } => out,
             State::Split { out1, .. } => out1,
-            State::Counter { out, .. } => out,
-            State::Repeat { out1, .. } => out1,
+            State::CounterInstance { out, .. } => out,
+            State::CounterIncrement { out1, .. } => out1,
+            State::Noop { out } => out,
             _ => unreachable!(),
         }
     }
@@ -108,12 +136,13 @@ impl State {
             State::Split { out1, .. } => {
                 *out1 = next;
             }
-            State::Counter { out, .. } => {
+            State::CounterInstance { out, .. } => {
                 *out = next;
             }
-            State::Repeat { out1, .. } => {
+            State::CounterIncrement { out1, .. } => {
                 *out1 = next;
             }
+            State::Noop { out } => *out = next,
             _ => unreachable!(),
         }
     }
@@ -132,22 +161,120 @@ impl Fragment {
 }
 
 #[derive(Debug)]
+enum RegexHirNode {
+    Alternate,
+    Catenate,
+    Char(char),
+    RepeatZeroOne,
+    RepeatZeroPlus,
+    RepeatOnePlus,
+    Wildcard,
+    CounterInstance { counter: usize },
+    CounterIncrement { counter: usize, count: usize },
+    Noop,
+}
+
+struct StateList(Box<[State]>);
+
+impl fmt::Debug for StateList {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        fmt.debug_map()
+            .entries(self.0.iter().enumerate().map(|(idx, state)| (idx, state)))
+            .finish()
+    }
+}
+
+impl std::ops::Deref for StateList {
+    type Target = [State];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[derive(Debug)]
 struct Regex {
-    states: Box<[State]>,
+    states: StateList,
     start: usize,
-    counters: usize,
+    counters: Box<[usize]>,
 }
 
 #[derive(Debug, Default)]
 struct RegexBuilder {
+    postfix: Vec<RegexHirNode>,
     states: Vec<State>,
-    counters: usize,
+    frags: Vec<Fragment>,
+    counters: Vec<usize>,
 }
 
 const INVALID_INDEX: usize = usize::MAX;
 
 impl RegexBuilder {
-    fn push(&mut self, state: State) -> usize {
+    fn next_counter(&mut self) -> usize {
+        let counter = self.counters.len();
+        self.counters.push(counter);
+        counter
+    }
+    fn node2hir(&mut self, node: &RegexAst) {
+        match node {
+            RegexAst::Alternate(children) => {
+                for (idx, child) in children.iter().enumerate() {
+                    self.node2hir(child);
+                    if idx > 0 {
+                        self.postfix.push(RegexHirNode::Alternate);
+                    }
+                }
+            }
+            RegexAst::Catenate(children) => {
+                for (idx, child) in children.iter().enumerate() {
+                    self.node2hir(child);
+                    if idx > 0 {
+                        self.postfix.push(RegexHirNode::Catenate);
+                    }
+                }
+            }
+            RegexAst::ZeroPlus(child) => {
+                self.node2hir(child);
+                self.postfix.push(RegexHirNode::RepeatZeroPlus);
+            }
+            RegexAst::OnePlus(child) => {
+                self.node2hir(child);
+                self.postfix.push(RegexHirNode::RepeatOnePlus);
+            }
+            RegexAst::ZeroOne(child) => {
+                self.node2hir(child);
+                self.postfix.push(RegexHirNode::RepeatZeroOne);
+            }
+            RegexAst::Repetition { node, count } => {
+                if *count > 0 {
+                    let counter = self.next_counter();
+                    self.node2hir(node);
+                    self.postfix.push(RegexHirNode::CounterInstance { counter });
+                    self.node2hir(node);
+                    self.postfix.push(RegexHirNode::CounterIncrement {
+                        counter,
+                        count: *count,
+                    });
+                    self.postfix.push(RegexHirNode::Catenate);
+                } else {
+                    self.postfix.push(RegexHirNode::Noop);
+                }
+            }
+            RegexAst::Char(c) => {
+                self.postfix.push(RegexHirNode::Char(*c));
+            }
+            RegexAst::Wildcard => {
+                self.postfix.push(RegexHirNode::Wildcard);
+            }
+        }
+    }
+
+    fn ast2hir(&mut self, root: &RegexAst) {
+        self.postfix.clear();
+        self.node2hir(root);
+    }
+
+    fn state(&mut self, state: State) -> usize {
         let idx = self.states.len();
         self.states.push(state);
         idx
@@ -161,25 +288,29 @@ impl RegexBuilder {
                     *out = idx;
                     next
                 }
-                State::Wildcard { out, .. } => {
-                    let next = *out;
-                    *out = idx;
-                    next
-                }
-
                 State::Split { out1, .. } => {
                     let next = *out1;
                     *out1 = idx;
                     next
                 }
-                State::Counter { out, .. } => {
+                State::Wildcard { out } => {
                     let next = *out;
                     *out = idx;
                     next
                 }
-                State::Repeat { out1, .. } => {
+                State::CounterInstance { out, .. } => {
+                    let next = *out;
+                    *out = idx;
+                    next
+                }
+                State::CounterIncrement { out1, .. } => {
                     let next = *out1;
                     *out1 = idx;
+                    next
+                }
+                State::Noop { out, .. } => {
+                    let next = *out;
+                    *out = idx;
                     next
                 }
                 _ => panic!("Invalid state: {:?}", state),
@@ -200,100 +331,107 @@ impl RegexBuilder {
         oldlist1
     }
 
-    fn next_catenate<'a>(
-        &mut self,
-        ast: &'a RegexAst,
-        mut nodes: impl Iterator<Item = &'a RegexAst>,
-    ) -> Fragment {
-        if let Some(next) = nodes.next() {
-            let e2 = self.next_catenate(next, nodes);
-            let e1 = self.next_fragment(ast);
-            self.patch(e1.out, e2.start);
-            Fragment::new(e1.start, e2.out)
-        } else {
-            self.next_fragment(ast)
-        }
-    }
-
-    fn next_alternate<'a>(
-        &mut self,
-        ast: &'a RegexAst,
-        mut nodes: impl Iterator<Item = &'a RegexAst>,
-    ) -> Fragment {
-        if let Some(next) = nodes.next() {
-            let e2 = self.next_alternate(next, nodes);
-            let e1 = self.next_fragment(ast);
-            let s = self.push(State::Split {
-                out: e1.start,
-                out1: e2.start,
-            });
-            Fragment::new(s, self.append(e1.out, e2.out))
-        } else {
-            self.next_fragment(ast)
-        }
-    }
-
-    fn next_fragment(&mut self, ast: &RegexAst) -> Fragment {
-        match ast {
-            RegexAst::Catenate(items) => {
-                let mut nodes = items.iter();
-                self.next_catenate(nodes.next().unwrap(), nodes)
+    #[inline]
+    fn next_fragment(&mut self, node: RegexHirNode) -> Fragment {
+        match node {
+            RegexHirNode::Catenate => {
+                let e2 = self.frags.pop().unwrap();
+                let e1 = self.frags.pop().unwrap();
+                self.patch(e1.out, e2.start);
+                Fragment::new(e1.start, e2.out)
             }
-            RegexAst::Alternate(items) => {
-                let mut nodes = items.iter();
-                self.next_alternate(nodes.next().unwrap(), nodes)
+            RegexHirNode::Alternate => {
+                let e2 = self.frags.pop().unwrap();
+                let e1 = self.frags.pop().unwrap();
+                let s = self.state(State::Split {
+                    out: e1.start,
+                    out1: e2.start,
+                });
+                Fragment::new(s, self.append(e1.out, e2.out))
             }
-            RegexAst::Repetition { node, count } => {
-                let e = self.next_fragment(node);
-                let s = self.push(State::Repeat {
-                    counter: self.counters,
+            RegexHirNode::RepeatZeroOne => {
+                let e = self.frags.pop().unwrap();
+                let s = self.state(State::Split {
                     out: e.start,
                     out1: INVALID_INDEX,
-                    count: *count,
                 });
-                self.patch(e.out, s);
-                let k = self.push(State::Counter {
-                    counter: self.counters,
-                    out: INVALID_INDEX,
-                });
-                let e1 = Fragment::new(k, k);
-                self.counters += 1;
-                self.patch(e1.out, s);
-                Fragment::new(e1.start, s)
+                Fragment::new(s, self.append(e.out, s))
             }
-            RegexAst::Char(char) => {
-                let idx = self.push(State::Char {
-                    char: *char,
-                    out: INVALID_INDEX,
-                });
-                Fragment::new(idx, idx)
-            }
-            RegexAst::Wildcard => {
-                let idx = self.push(State::Wildcard { out: INVALID_INDEX });
-                Fragment::new(idx, idx)
-            }
-            RegexAst::Star(node) => {
-                let e = self.next_fragment(node);
-                let s = self.push(State::Split {
+            RegexHirNode::RepeatZeroPlus => {
+                let e = self.frags.pop().unwrap();
+                let s = self.state(State::Split {
                     out: e.start,
                     out1: INVALID_INDEX,
                 });
                 self.patch(e.out, s);
                 Fragment::new(s, s)
             }
+            RegexHirNode::RepeatOnePlus => {
+                let e = self.frags.pop().unwrap();
+                let s = self.state(State::Split {
+                    out: e.start,
+                    out1: INVALID_INDEX,
+                });
+                self.patch(e.out, s);
+                Fragment::new(e.start, s)
+            }
+            RegexHirNode::CounterInstance { counter } => {
+                let e = self.frags.pop().unwrap();
+                let s = self.state(State::CounterInstance {
+                    counter,
+                    out: INVALID_INDEX,
+                });
+                self.patch(e.out, s);
+                Fragment::new(e.start, s)
+            }
+            RegexHirNode::CounterIncrement { counter, count } => {
+                let e = self.frags.pop().unwrap();
+                let s = self.state(State::CounterIncrement {
+                    out: e.start,
+                    out1: INVALID_INDEX,
+                    count,
+                    counter,
+                });
+                self.patch(e.out, s);
+                Fragment::new(s, s)
+            }
+            RegexHirNode::Wildcard => {
+                let idx = self.state(State::Wildcard { out: INVALID_INDEX });
+                Fragment::new(idx, idx)
+            }
+            RegexHirNode::Char(char) => {
+                let idx = self.state(State::Char {
+                    char,
+                    out: INVALID_INDEX,
+                });
+                Fragment::new(idx, idx)
+            }
+            RegexHirNode::Noop => {
+                let idx = self.state(State::Noop { out: INVALID_INDEX });
+                Fragment::new(idx, idx)
+            }
         }
     }
 
-    fn build(&mut self, ast: &RegexAst) -> Regex {
+    pub fn build(&mut self, ast: &RegexAst) -> Regex {
         self.states.clear();
-        self.counters = 0;
-        let e = self.next_fragment(ast);
-        let s = self.push(State::Match);
+        self.frags.clear();
+        self.ast2hir(ast);
+        println!("postfix: {:#?}", self.postfix);
+        let mut postfix = std::mem::take(&mut self.postfix);
+        for node in postfix.drain(..) {
+            let frag = self.next_fragment(node);
+            self.frags.push(frag)
+        }
+        self.postfix = postfix;
+        let e = self.frags.pop().unwrap();
+        assert!(self.frags.is_empty());
+        let s = self.state(State::Match);
         self.patch(e.out, s);
         Regex {
-            states: self.states.to_vec().into_boxed_slice(),
+            states: StateList(self.states.to_vec().into_boxed_slice()),
             start: e.start,
-            counters: self.counters,
+            counters: self.counters.to_vec().into_boxed_slice(),
         }
     }
 }
@@ -311,7 +449,7 @@ impl MatcherMemory {
         self.lastlist.clear();
         self.lastlist.resize(regex.states.len(), usize::MAX);
         self.counters.clear();
-        self.counters.resize(regex.counters, None);
+        self.counters.resize(regex.counters.len(), None);
         self.clist.clear();
         self.nlist.clear();
 
@@ -335,6 +473,32 @@ struct Counter {
     value: usize,
     delta: usize,
     deltas: VecDeque<usize>,
+}
+
+impl Counter {
+    fn push(&mut self) {
+        assert!(self.delta > 0);
+        self.deltas.push_back(self.delta);
+        self.delta = 0;
+    }
+
+    fn incr(&mut self) {
+        self.value += 1;
+        self.delta += 1;
+    }
+
+    // Return true is if the counter has no instances left
+    // false otherwise.
+    fn pop(&mut self) -> bool {
+        assert!(self.value > 0);
+        if let Some(delta) = self.deltas.pop_front() {
+            assert!(delta < self.value);
+            self.value -= delta;
+            false
+        } else {
+            true
+        }
+    }
 }
 
 impl Default for Counter {
@@ -371,8 +535,7 @@ impl<'a> Matcher<'a> {
             idx, self.counters[idx]
         );
         if let Some(counter) = self.counters[idx].as_mut() {
-            counter.deltas.push_back(counter.delta);
-            counter.delta = 0;
+            counter.push();
         } else {
             self.counters[idx] = Some(Counter::default());
         }
@@ -383,9 +546,7 @@ impl<'a> Matcher<'a> {
             "INCREMENTING VALUE FOR COUNTER {} = {:#?}",
             idx, self.counters[idx]
         );
-        let counter = self.counters[idx].as_mut().unwrap();
-        counter.value += 1;
-        counter.delta += 1;
+        self.counters[idx].as_mut().unwrap().incr();
     }
 
     fn delcounter(&mut self, idx: usize) {
@@ -393,12 +554,7 @@ impl<'a> Matcher<'a> {
             "DELETING INSTANCE FOR COUNTER {} = {:#?}",
             idx, self.counters[idx]
         );
-        let counter = self.counters[idx].as_mut().unwrap();
-        assert!(counter.value > 0);
-        if let Some(delta) = counter.deltas.pop_front() {
-            assert!(delta < counter.value);
-            counter.value -= delta;
-        } else {
+        if self.counters[idx].as_mut().unwrap().pop() {
             self.counters[idx] = None;
         }
     }
@@ -416,12 +572,11 @@ impl<'a> Matcher<'a> {
                 self.addstate(out);
                 self.addstate(out1);
             }
-            State::Counter { out, counter } => {
+            State::CounterInstance { out, counter } => {
                 self.addcounter(counter);
-                self.lastlist[out] = usize::MAX;
                 self.addstate(out);
             }
-            State::Repeat {
+            State::CounterIncrement {
                 out,
                 out1,
                 count,
@@ -429,8 +584,7 @@ impl<'a> Matcher<'a> {
                 ..
             } => {
                 self.inccounter(counter);
-                self.lastlist[idx] = self.listid;
-                let value = self.counters[counter].as_ref().unwrap().value - 1;
+                let value = self.counters[counter].as_ref().unwrap().value;
                 let single = self.counters[counter].as_ref().unwrap().deltas.is_empty();
                 println!(
                     "[addstate:repeat] count = {}, value = {}, single = {}",
@@ -446,6 +600,9 @@ impl<'a> Matcher<'a> {
                     self.delcounter(counter);
                     self.addstate(out1);
                 }
+            }
+            State::Noop { out } => {
+                self.addstate(out);
             }
             _ => {}
         }
@@ -547,7 +704,7 @@ pub(crate) mod tests {
     #[test]
     fn test_counting() {
         let ast = RegexAst::Catenate(vec![
-            RegexAst::Star(Box::new(RegexAst::Wildcard)),
+            RegexAst::ZeroPlus(Box::new(RegexAst::Wildcard)),
             RegexAst::Char('a'),
             RegexAst::Repetition {
                 node: Box::new(RegexAst::Wildcard),
@@ -617,7 +774,7 @@ pub(crate) mod tests {
             println!("input = {:?}", input);
             let mut matcher = memory.matcher(&regex);
             matcher.chunk(&input);
-            assert!(matcher.ismatch());
+            assert!(matcher.ismatch(), "input = {} should have matched", input);
         }
 
         for v in std::iter::repeat(["a", "bc"])
@@ -682,5 +839,39 @@ pub(crate) mod tests {
             matcher.chunk(&input);
             assert!(!matcher.ismatch());
         }
+    }
+
+    #[test]
+    fn test_empty_counting() {
+        use itertools::Itertools;
+
+        let mut builder = RegexBuilder::default();
+        let mut memory = MatcherMemory::default();
+
+        let ast = RegexAst::Repetition {
+            node: Box::new(RegexAst::Alternate(vec![
+                RegexAst::Catenate(vec![RegexAst::Char('a')]),
+                RegexAst::Catenate(vec![RegexAst::Char('b'), RegexAst::Char('c')]),
+            ])),
+            count: 0,
+        };
+        println!("pattern: {}", ast);
+
+        let regex = builder.build(&ast);
+        println!("regex: {:#?}", regex);
+
+        let mut matcher = memory.matcher(&regex);
+        matcher.chunk("");
+        assert!(matcher.ismatch());
+
+        let input = "a";
+        let mut matcher = memory.matcher(&regex);
+        matcher.chunk(input);
+        assert!(!matcher.ismatch());
+
+        let input = "bc";
+        let mut matcher = memory.matcher(&regex);
+        matcher.chunk(input);
+        assert!(!matcher.ismatch());
     }
 }
