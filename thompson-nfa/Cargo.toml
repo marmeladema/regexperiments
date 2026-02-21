@@ -1,5 +1,5 @@
 [package]
-name = "thompsom-nfa"
+name = "thompson-nfa"
 version = "0.1.0"
 edition = "2021"
 

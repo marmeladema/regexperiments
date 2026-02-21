@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "counting-nfa",
+    "counting-nfa2",
+    "range-counting-nfa",
+    "range-counting-nfa2",
+    "thompson-ast",
+    "thompson-hir",
+    "thompson-nfa",
+]
+resolver = "2"
