@@ -79,6 +79,7 @@ enum RegexAst {
     Char(char),
     Wildcard,
     ZeroPlus(Box<RegexAst>),
+    OnePlus(Box<RegexAst>),
     ZeroOne(Box<RegexAst>),
 }
 
@@ -108,6 +109,7 @@ impl fmt::Display for RegexAst {
                         | RegexAst::Alternate { .. }
                         | RegexAst::Repetition { .. }
                         | RegexAst::ZeroPlus(_)
+                        | RegexAst::OnePlus(_)
                         | RegexAst::ZeroOne(_)
                 );
                 if needs_group {
@@ -133,6 +135,16 @@ impl fmt::Display for RegexAst {
                     write!(f, "({})*", node)
                 } else {
                     write!(f, "{}*", node)
+                }
+            }
+            Self::OnePlus(node) => {
+                if matches!(
+                    **node,
+                    RegexAst::Catenate { .. } | RegexAst::Alternate { .. }
+                ) {
+                    write!(f, "({})+", node)
+                } else {
+                    write!(f, "{}+", node)
                 }
             }
             Self::ZeroOne(node) => {
@@ -424,6 +436,10 @@ impl RegexBuilder {
             RegexAst::ZeroPlus(child) => {
                 self.node2hir(child);
                 self.postfix.push(RegexHirNode::RepeatZeroPlus);
+            }
+            RegexAst::OnePlus(child) => {
+                self.node2hir(child);
+                self.postfix.push(RegexHirNode::RepeatOnePlus);
             }
             RegexAst::ZeroOne(child) => {
                 self.node2hir(child);
@@ -1186,5 +1202,230 @@ mod tests {
         assert_matches_regex_crate(&ast, "a");
         assert_matches_regex_crate(&ast, "aa");
         assert_matches_regex_crate(&ast, "aaa");
+    }
+
+    /// `a+` — basic one-or-more repetition.
+    #[test]
+    fn test_one_plus_basic() {
+        let ast = RegexAst::OnePlus(Box::new(RegexAst::Char('a')));
+
+        assert_matches_regex_crate(&ast, "");
+        assert_matches_regex_crate(&ast, "a");
+        assert_matches_regex_crate(&ast, "aa");
+        assert_matches_regex_crate(&ast, "aaa");
+        assert_matches_regex_crate(&ast, "b");
+    }
+
+    /// `.+` — one-or-more wildcard.
+    #[test]
+    fn test_one_plus_wildcard() {
+        let ast = RegexAst::OnePlus(Box::new(RegexAst::Wildcard));
+
+        assert_matches_regex_crate(&ast, "");
+        assert_matches_regex_crate(&ast, "a");
+        assert_matches_regex_crate(&ast, "ab");
+        assert_matches_regex_crate(&ast, "abc");
+    }
+
+    /// `a+b+` — consecutive one-or-more repetitions.
+    #[test]
+    fn test_one_plus_catenation() {
+        let ast = RegexAst::Catenate(vec![
+            RegexAst::OnePlus(Box::new(RegexAst::Char('a'))),
+            RegexAst::OnePlus(Box::new(RegexAst::Char('b'))),
+        ]);
+
+        assert_matches_regex_crate(&ast, "");
+        assert_matches_regex_crate(&ast, "a");
+        assert_matches_regex_crate(&ast, "b");
+        assert_matches_regex_crate(&ast, "ab");
+        assert_matches_regex_crate(&ast, "aab");
+        assert_matches_regex_crate(&ast, "abb");
+        assert_matches_regex_crate(&ast, "aabb");
+        assert_matches_regex_crate(&ast, "ba");
+    }
+
+    /// `(ab)+` — one-or-more of a multi-char sequence.
+    #[test]
+    fn test_one_plus_group() {
+        let ast = RegexAst::OnePlus(Box::new(RegexAst::Catenate(vec![
+            RegexAst::Char('a'),
+            RegexAst::Char('b'),
+        ])));
+
+        assert_matches_regex_crate(&ast, "");
+        assert_matches_regex_crate(&ast, "a");
+        assert_matches_regex_crate(&ast, "ab");
+        assert_matches_regex_crate(&ast, "abab");
+        assert_matches_regex_crate(&ast, "ababab");
+        assert_matches_regex_crate(&ast, "aba");
+    }
+
+    /// `(a|b)+` — one-or-more alternation.
+    #[test]
+    fn test_one_plus_alternate() {
+        let ast = RegexAst::OnePlus(Box::new(RegexAst::Alternate(vec![
+            RegexAst::Char('a'),
+            RegexAst::Char('b'),
+        ])));
+
+        assert_matches_regex_crate(&ast, "");
+        assert_matches_regex_crate(&ast, "a");
+        assert_matches_regex_crate(&ast, "b");
+        assert_matches_regex_crate(&ast, "ab");
+        assert_matches_regex_crate(&ast, "ba");
+        assert_matches_regex_crate(&ast, "aab");
+        assert_matches_regex_crate(&ast, "c");
+    }
+
+    /// `.*a.{3}b+c` — one-or-more mixed with counting constraints.
+    #[test]
+    fn test_one_plus_with_counting() {
+        let ast = RegexAst::Catenate(vec![
+            RegexAst::ZeroPlus(Box::new(RegexAst::Wildcard)),
+            RegexAst::Char('a'),
+            RegexAst::Repetition {
+                node: Box::new(RegexAst::Wildcard),
+                min: Some(3),
+                max: Some(3),
+            },
+            RegexAst::OnePlus(Box::new(RegexAst::Char('b'))),
+            RegexAst::Char('c'),
+        ]);
+
+        assert_matches_regex_crate(&ast, "a123bc");
+        assert_matches_regex_crate(&ast, "a123bbc");
+        assert_matches_regex_crate(&ast, "a123bbbc");
+        assert_matches_regex_crate(&ast, "a123c");
+        assert_matches_regex_crate(&ast, "xa123bc");
+        assert_matches_regex_crate(&ast, "");
+    }
+
+    /// `(a{2,3})+` — inner repetition, outer one-or-more.
+    /// The body of `+` is itself a counted repetition.
+    #[test]
+    fn test_repetition_inside_one_plus() {
+        let ast = RegexAst::OnePlus(Box::new(RegexAst::Repetition {
+            node: Box::new(RegexAst::Char('a')),
+            min: Some(2),
+            max: Some(3),
+        }));
+
+        assert_matches_regex_crate(&ast, "");
+        assert_matches_regex_crate(&ast, "a");
+        assert_matches_regex_crate(&ast, "aa");
+        assert_matches_regex_crate(&ast, "aaa");
+        assert_matches_regex_crate(&ast, "aaaa");
+        assert_matches_regex_crate(&ast, "aaaaa");
+        assert_matches_regex_crate(&ast, "aaaaaa");
+        assert_matches_regex_crate(&ast, "aaaaaaa");
+        assert_matches_regex_crate(&ast, "aaaaaaaa");
+        assert_matches_regex_crate(&ast, "aaaaaaaaa");
+        assert_matches_regex_crate(&ast, "b");
+    }
+
+    /// `((a|bc){1,2})+` — inner range repetition of alternation, outer `+`.
+    #[test]
+    fn test_range_alternation_inside_one_plus() {
+        use itertools::Itertools;
+
+        let ast = RegexAst::OnePlus(Box::new(range_regex()));
+
+        assert_matches_regex_crate(&ast, "");
+        assert_matches_regex_crate(&ast, "a");
+        assert_matches_regex_crate(&ast, "bc");
+        assert_matches_regex_crate(&ast, "b");
+        assert_matches_regex_crate(&ast, "c");
+
+        // 2 through 6 atoms — exercises multiple iterations of the outer `+`
+        for i in 2..=6 {
+            for v in std::iter::repeat(["a", "bc"])
+                .take(i)
+                .map(|a| a.into_iter())
+                .multi_cartesian_product()
+            {
+                let input = v.into_iter().collect::<String>();
+                assert_matches_regex_crate(&ast, &input);
+            }
+        }
+    }
+
+    /// `(a+){2,3}` — inner one-or-more, outer counted repetition.
+    #[test]
+    fn test_one_plus_inside_repetition() {
+        let ast = RegexAst::Repetition {
+            node: Box::new(RegexAst::OnePlus(Box::new(RegexAst::Char('a')))),
+            min: Some(2),
+            max: Some(3),
+        };
+
+        assert_matches_regex_crate(&ast, "");
+        assert_matches_regex_crate(&ast, "a");
+        assert_matches_regex_crate(&ast, "aa");
+        assert_matches_regex_crate(&ast, "aaa");
+        assert_matches_regex_crate(&ast, "aaaa");
+        assert_matches_regex_crate(&ast, "aaaaa");
+        assert_matches_regex_crate(&ast, "aaaaaa");
+        assert_matches_regex_crate(&ast, "aaaaaaa");
+        assert_matches_regex_crate(&ast, "b");
+    }
+
+    /// `((a|b)+){2,4}` — inner `+` of alternation, outer counted repetition.
+    #[test]
+    fn test_one_plus_alternation_inside_repetition() {
+        use itertools::Itertools;
+
+        let ast = RegexAst::Repetition {
+            node: Box::new(RegexAst::OnePlus(Box::new(RegexAst::Alternate(vec![
+                RegexAst::Char('a'),
+                RegexAst::Char('b'),
+            ])))),
+            min: Some(2),
+            max: Some(4),
+        };
+
+        assert_matches_regex_crate(&ast, "");
+        assert_matches_regex_crate(&ast, "a");
+        assert_matches_regex_crate(&ast, "b");
+        assert_matches_regex_crate(&ast, "c");
+
+        for i in 2..=8 {
+            for v in std::iter::repeat(["a", "b"])
+                .take(i)
+                .map(|a| a.into_iter())
+                .multi_cartesian_product()
+            {
+                let input = v.into_iter().collect::<String>();
+                assert_matches_regex_crate(&ast, &input);
+            }
+        }
+    }
+
+    /// `(a+b{2,3})+` — inner `+` and inner repetition side-by-side,
+    /// wrapped in outer `+`.
+    #[test]
+    fn test_mixed_plus_and_repetition_inside_one_plus() {
+        let ast = RegexAst::OnePlus(Box::new(RegexAst::Catenate(vec![
+            RegexAst::OnePlus(Box::new(RegexAst::Char('a'))),
+            RegexAst::Repetition {
+                node: Box::new(RegexAst::Char('b')),
+                min: Some(2),
+                max: Some(3),
+            },
+        ])));
+
+        assert_matches_regex_crate(&ast, "");
+        assert_matches_regex_crate(&ast, "a");
+        assert_matches_regex_crate(&ast, "ab");
+        assert_matches_regex_crate(&ast, "abb");
+        assert_matches_regex_crate(&ast, "abbb");
+        assert_matches_regex_crate(&ast, "abbbb");
+        assert_matches_regex_crate(&ast, "aabb");
+        assert_matches_regex_crate(&ast, "aabbb");
+        assert_matches_regex_crate(&ast, "abbabb");
+        assert_matches_regex_crate(&ast, "abbaabb");
+        assert_matches_regex_crate(&ast, "abbabbbabb");
+        assert_matches_regex_crate(&ast, "aabbaabbb");
+        assert_matches_regex_crate(&ast, "aabbbaabbb");
     }
 }
