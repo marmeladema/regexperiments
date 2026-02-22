@@ -1,13 +1,76 @@
-//! Based on Russ Cox's article from https://swtch.com/~rsc/regexp/regexp1.html
-//! with additional support for counting constraints from https://www.arl.wustl.edu/~pcrowley/a25-becchi.pdf
+//! Thompson NFA with multi-instance counting constraints.
+//!
+//! Based on Russ Cox's article <https://swtch.com/~rsc/regexp/regexp1.html>
+//! (Thompson NFA construction and simulation) with additional support for
+//! bounded repetitions (`{min,max}`) via the counting-FA model described in
+//! Becchi & Crowley, "Extending Finite Automata to Efficiently Match
+//! Perl-Compatible Regular Expressions" (CoNEXT 2008)
+//! <https://www.arl.wustl.edu/~pcrowley/a25-becchi.pdf>.
+//!
+//! # Architecture
+//!
+//! The pipeline is:
+//!
+//! ```text
+//! RegexAst  ──node2hir──>  postfix HIR  ──next_fragment──>  NFA states
+//! ```
+//!
+//! ## Counting constraints
+//!
+//! A repetition `body{min,max}` is lowered to:
+//!
+//! ```text
+//! body ── CounterInstance(c) ── body_copy ── CounterIncrement(c, min, max)
+//!                                  ^                    │
+//!                                  └── continue ────────┘
+//!                                            break ──> (next)
+//! ```
+//!
+//! The first `body` is the mandatory initial match.  `CounterInstance`
+//! allocates a new counter instance (or creates the counter from scratch).
+//! The `body_copy` + `CounterIncrement` loop runs zero or more additional
+//! times.  `CounterIncrement` increments all active instances; when the
+//! oldest instance's value falls in `[min, max]`, the break path is
+//! followed.  When it reaches `max`, the oldest instance is de-allocated.
+//!
+//! Counters use a **differential representation** (from the Becchi paper)
+//! so that increment and condition-evaluation require O(1) work regardless
+//! of how many instances are active.
+//!
+//! ## Nested repetitions
+//!
+//! When a repetition body itself contains a repetition, the body copy in
+//! the outer counting loop gets **remapped** counter indices so that each
+//! copy of the inner repetition operates its own independent counter.
+//!
+//! A subtle interaction arises when the outer counter is exhausted
+//! (`None`) by one NFA path in the same simulation step, and a second
+//! path (arriving via an inner `CounterInstance`) legitimately needs to
+//! restart the outer counter.  We distinguish this from the
+//! epsilon-body case (where no `CounterInstance` fired and the `None`
+//! counter should stay dead) using a **generation counter** (`ci_gen`)
+//! that increments every time any `CounterInstance` fires.  Re-entry at
+//! a `CounterIncrement` with a `None` counter is allowed only if `ci_gen`
+//! has advanced since the state's first visit in the current step.
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::io::Write;
 
+// ---------------------------------------------------------------------------
+// AST
+// ---------------------------------------------------------------------------
+
+/// A regex abstract syntax tree node.
+///
+/// Produced by the parser (not included here) and consumed by
+/// [`RegexBuilder::node2hir`] to generate a postfix HIR.
 #[derive(Debug)]
 enum RegexAst {
     Catenate(Vec<RegexAst>),
     Alternate(Vec<RegexAst>),
+    /// Bounded repetition `node{min,max}`.  `None` means unbounded on that
+    /// side (e.g. `{3,}` has `max = None`).
     Repetition {
         node: Box<RegexAst>,
         min: Option<usize>,
@@ -16,7 +79,6 @@ enum RegexAst {
     Char(char),
     Wildcard,
     ZeroPlus(Box<RegexAst>),
-    OnePlus(Box<RegexAst>),
     ZeroOne(Box<RegexAst>),
 }
 
@@ -46,7 +108,6 @@ impl fmt::Display for RegexAst {
                         | RegexAst::Alternate { .. }
                         | RegexAst::Repetition { .. }
                         | RegexAst::ZeroPlus(_)
-                        | RegexAst::OnePlus(_)
                         | RegexAst::ZeroOne(_)
                 );
                 if needs_group {
@@ -74,16 +135,6 @@ impl fmt::Display for RegexAst {
                     write!(f, "{}*", node)
                 }
             }
-            Self::OnePlus(node) => {
-                if matches!(
-                    **node,
-                    RegexAst::Catenate { .. } | RegexAst::Alternate { .. }
-                ) {
-                    write!(f, "({})+", node)
-                } else {
-                    write!(f, "{}+", node)
-                }
-            }
             Self::ZeroOne(node) => {
                 if matches!(
                     **node,
@@ -98,18 +149,31 @@ impl fmt::Display for RegexAst {
     }
 }
 
+// ---------------------------------------------------------------------------
+// NFA states
+// ---------------------------------------------------------------------------
+
+/// A single NFA state.
+///
+/// Epsilon states (`Split`, `CounterInstance`, `CounterIncrement`, `Noop`)
+/// are followed during [`Matcher::addstate`].  Character-consuming states
+/// (`Char`, `Wildcard`) are stepped over in [`Matcher::step`].
 #[derive(Clone, Copy, Debug)]
 enum State {
-    Split {
-        out: usize,
-        out1: usize,
-    },
-    // Creates a new counter instance
-    CounterInstance {
-        counter: usize,
-        out: usize,
-    },
-    // Increments all instances of a counter
+    /// Epsilon fork: follow both `out` and `out1`.
+    Split { out: usize, out1: usize },
+
+    /// Allocate (or push) a new instance on counter `counter`, then
+    /// follow `out`.
+    CounterInstance { counter: usize, out: usize },
+
+    /// Increment counter `counter`.
+    ///
+    /// - **Continue** (`out`): re-enter the repetition body (taken when
+    ///   the counter has not yet reached `max`, or when there are
+    ///   multiple instances and the oldest has not yet reached `max`).
+    /// - **Break** (`out1`): exit the repetition (taken when any instance
+    ///   value falls in `[min, max]`).
     CounterIncrement {
         counter: usize,
         out: usize,
@@ -117,108 +181,53 @@ enum State {
         min: usize,
         max: usize,
     },
-    Char {
-        char: char,
-        out: usize,
-    },
-    Wildcard {
-        out: usize,
-    },
-    Noop {
-        out: usize,
-    },
+
+    /// Match a literal character, then follow `out`.
+    Char { char: char, out: usize },
+
+    /// Match any character, then follow `out`.
+    Wildcard { out: usize },
+
+    /// Unconditional epsilon transition (placeholder).
+    Noop { out: usize },
+
+    /// Accepting state.
     Match,
 }
 
 impl State {
+    /// Return the "dangling out" pointer used by [`RegexBuilder::patch`]
+    /// and [`RegexBuilder::append`] to thread fragment lists.
     fn next(self) -> usize {
         match self {
-            State::Char { out, .. } => out,
-            State::Wildcard { out, .. } => out,
-            State::Split { out1, .. } => out1,
-            State::CounterInstance { out, .. } => out,
-            State::CounterIncrement { out1, .. } => out1,
-            State::Noop { out } => out,
+            State::Char { out, .. }
+            | State::Wildcard { out, .. }
+            | State::CounterInstance { out, .. }
+            | State::Noop { out } => out,
+            State::Split { out1, .. } | State::CounterIncrement { out1, .. } => out1,
             _ => unreachable!(),
         }
     }
 
+    /// Overwrite the "dangling out" pointer.
     fn append(&mut self, next: usize) {
         match self {
-            State::Char { out, .. } => {
-                *out = next;
-            }
-            State::Wildcard { out, .. } => {
-                *out = next;
-            }
-            State::Split { out1, .. } => {
-                *out1 = next;
-            }
-            State::CounterInstance { out, .. } => {
-                *out = next;
-            }
-            State::CounterIncrement { out1, .. } => {
-                *out1 = next;
-            }
-            State::Noop { out } => *out = next,
+            State::Char { out, .. }
+            | State::Wildcard { out, .. }
+            | State::CounterInstance { out, .. }
+            | State::Noop { out } => *out = next,
+            State::Split { out1, .. } | State::CounterIncrement { out1, .. } => *out1 = next,
             _ => unreachable!(),
-        }
-    }
-
-    fn to_dot(
-        &self,
-        idx: usize,
-        states: &[State],
-        buffer: &mut impl Write,
-        stack: &mut Vec<usize>,
-    ) -> Result<(), std::io::Error> {
-        match self {
-            State::Split { out, out1 } => {
-                states[*out].to_dot(idx, states, buffer, stack)?;
-                states[*out1].to_dot(idx, states, buffer, stack)
-            }
-            State::CounterInstance { counter, out } => {
-                stack.push(*out);
-                writeln!(
-                    buffer,
-                    "\t{} -> {} [label=\"CounterInstance-{}\"];",
-                    idx, out, counter
-                )
-            }
-            State::CounterIncrement {
-                counter,
-                out,
-                out1,
-                min,
-                max,
-            } => {
-                stack.push(*out);
-                writeln!(
-                    buffer,
-                    "\t{} -> {} [label=\"Continue-{}{{{},{}}}\"];",
-                    idx, out, counter, min, max
-                )?;
-                stack.push(*out1);
-                writeln!(
-                    buffer,
-                    "\t{} -> {} [label=\"Break-{}{{{},{}}}\"];",
-                    idx, out1, counter, min, max
-                )
-            }
-            State::Char { char, out } => {
-                stack.push(*out);
-                writeln!(buffer, "\t{} -> {} [label=\"{}\"];", idx, out, char)
-            }
-            State::Wildcard { out } => {
-                stack.push(*out);
-                writeln!(buffer, "\t{} -> {} [label=\"*\"];", idx, out)
-            }
-            State::Match => writeln!(buffer, "\t{} [peripheries=2];", idx),
-            State::Noop { .. } => todo!(),
         }
     }
 }
 
+// ---------------------------------------------------------------------------
+// NFA fragment (used during construction)
+// ---------------------------------------------------------------------------
+
+/// A partially-built NFA fragment with a `start` state and a dangling
+/// `out` pointer that will be patched to the next fragment's start.
 #[derive(Debug)]
 struct Fragment {
     start: usize,
@@ -231,6 +240,12 @@ impl Fragment {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Postfix HIR nodes
+// ---------------------------------------------------------------------------
+
+/// A postfix HIR instruction consumed by [`RegexBuilder::next_fragment`]
+/// to emit NFA states.
 #[derive(Copy, Clone, Debug)]
 enum RegexHirNode {
     Alternate,
@@ -251,6 +266,10 @@ enum RegexHirNode {
     Noop,
 }
 
+// ---------------------------------------------------------------------------
+// Compiled regex
+// ---------------------------------------------------------------------------
+
 struct StateList(Box<[State]>);
 
 impl fmt::Debug for StateList {
@@ -263,22 +282,23 @@ impl fmt::Debug for StateList {
 
 impl std::ops::Deref for StateList {
     type Target = [State];
-
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
+/// A compiled NFA ready for matching.
 #[derive(Debug)]
 struct Regex {
     states: StateList,
     start: usize,
+    /// One slot per counter variable allocated during compilation.
     counters: Box<[usize]>,
 }
 
-use std::io::Write;
-
 impl Regex {
+    /// Emit a Graphviz DOT representation of the NFA.
+    #[allow(dead_code)]
     fn to_dot(&self, mut buffer: impl Write) {
         let mut visited = vec![false; self.states.len()];
         writeln!(buffer, "digraph graphname {{").unwrap();
@@ -288,16 +308,77 @@ impl Regex {
         while let Some(idx) = stack.pop() {
             if !visited[idx] {
                 writeln!(buffer, "\t// [{}] {:?}", idx, self.states[idx]).unwrap();
-                self.states[idx]
-                    .to_dot(idx, &self.states, &mut buffer, &mut stack)
-                    .unwrap();
+                self.write_dot_state(idx, &mut buffer, &mut stack);
                 visited[idx] = true;
             }
         }
         writeln!(buffer, "}}").unwrap();
     }
+
+    fn write_dot_state(&self, idx: usize, buffer: &mut impl Write, stack: &mut Vec<usize>) {
+        match self.states[idx] {
+            State::Split { out, out1 } => {
+                self.write_dot_state(out, buffer, stack);
+                self.write_dot_state(out1, buffer, stack);
+            }
+            State::CounterInstance { counter, out } => {
+                stack.push(out);
+                writeln!(buffer, "\t{} -> {} [label=\"CI-{}\"];", idx, out, counter).unwrap();
+            }
+            State::CounterIncrement {
+                counter,
+                out,
+                out1,
+                min,
+                max,
+            } => {
+                stack.push(out);
+                writeln!(
+                    buffer,
+                    "\t{} -> {} [label=\"cont-{}{{{},{}}}\"];",
+                    idx, out, counter, min, max
+                )
+                .unwrap();
+                stack.push(out1);
+                writeln!(
+                    buffer,
+                    "\t{} -> {} [label=\"break-{}{{{},{}}}\"];",
+                    idx, out1, counter, min, max
+                )
+                .unwrap();
+            }
+            State::Char { char: c, out } => {
+                stack.push(out);
+                writeln!(buffer, "\t{} -> {} [label=\"{}\"];", idx, out, c).unwrap();
+            }
+            State::Wildcard { out } => {
+                stack.push(out);
+                writeln!(buffer, "\t{} -> {} [label=\".\"];", idx, out).unwrap();
+            }
+            State::Match => {
+                writeln!(buffer, "\t{} [peripheries=2];", idx).unwrap();
+            }
+            State::Noop { .. } => {}
+        }
+    }
 }
 
+// ---------------------------------------------------------------------------
+// NFA builder (AST -> HIR -> NFA)
+// ---------------------------------------------------------------------------
+
+/// Sentinel used for yet-unpatched `out` pointers in NFA states.
+const DANGLING: usize = usize::MAX;
+
+/// Builds a compiled [`Regex`] from a [`RegexAst`].
+///
+/// The pipeline is:
+/// 1. [`node2hir`](Self::node2hir) — recursively lowers the AST into a
+///    postfix sequence of [`RegexHirNode`]s.
+/// 2. [`next_fragment`](Self::next_fragment) — consumes postfix nodes one
+///    at a time, emitting NFA [`State`]s and wiring [`Fragment`]s together.
+/// 3. [`build`](Self::build) — drives the pipeline and patches the final
+///    fragment to the `Match` state.
 #[derive(Debug, Default)]
 struct RegexBuilder {
     postfix: Vec<RegexHirNode>,
@@ -306,14 +387,22 @@ struct RegexBuilder {
     counters: Vec<usize>,
 }
 
-const INVALID_INDEX: usize = usize::MAX;
-
 impl RegexBuilder {
+    /// Allocate a fresh counter index.
     fn next_counter(&mut self) -> usize {
         let counter = self.counters.len();
         self.counters.push(counter);
         counter
     }
+
+    /// Recursively lower an AST node into a postfix HIR sequence appended
+    /// to `self.postfix`.
+    ///
+    /// For bounded repetitions (`Repetition`), the body is emitted twice:
+    /// once before `CounterInstance` (the mandatory first match) and once
+    /// inside the counting loop (before `CounterIncrement`).  The second
+    /// copy has all inner counter indices **remapped** so that nested
+    /// repetitions get independent counters.
     fn node2hir(&mut self, node: &RegexAst) {
         match node {
             RegexAst::Alternate(children) => {
@@ -336,10 +425,6 @@ impl RegexBuilder {
                 self.node2hir(child);
                 self.postfix.push(RegexHirNode::RepeatZeroPlus);
             }
-            RegexAst::OnePlus(child) => {
-                self.node2hir(child);
-                self.postfix.push(RegexHirNode::RepeatOnePlus);
-            }
             RegexAst::ZeroOne(child) => {
                 self.node2hir(child);
                 self.postfix.push(RegexHirNode::RepeatZeroOne);
@@ -351,25 +436,48 @@ impl RegexBuilder {
                 if min > 0 {
                     let counter = self.next_counter();
 
+                    // Emit the body once (mandatory initial match).
                     let start = self.postfix.len();
                     self.node2hir(node);
                     let end = self.postfix.len();
+
                     self.postfix.push(RegexHirNode::CounterInstance { counter });
-                    /*self.node2hir(node);*/
-                    self.postfix.extend_from_within(start..end);
+
+                    // Copy the body HIR for the counting loop, remapping any
+                    // counter indices so each copy of a nested repetition
+                    // gets its own independent counter.
+                    let body = self.postfix[start..end].to_vec();
+                    let mut counter_map = std::collections::HashMap::new();
+                    for hir_node in body {
+                        let remapped = match hir_node {
+                            RegexHirNode::CounterInstance { counter: c } => {
+                                let new_c =
+                                    *counter_map.entry(c).or_insert_with(|| self.next_counter());
+                                RegexHirNode::CounterInstance { counter: new_c }
+                            }
+                            RegexHirNode::CounterIncrement {
+                                counter: c,
+                                min: mn,
+                                max: mx,
+                            } => {
+                                let new_c =
+                                    *counter_map.entry(c).or_insert_with(|| self.next_counter());
+                                RegexHirNode::CounterIncrement {
+                                    counter: new_c,
+                                    min: mn,
+                                    max: mx,
+                                }
+                            }
+                            other => other,
+                        };
+                        self.postfix.push(remapped);
+                    }
+
                     self.postfix
                         .push(RegexHirNode::CounterIncrement { counter, min, max });
                     self.postfix.push(RegexHirNode::Catenate);
-
-                    /*self.node2hir(node);
-                    self.postfix.push(RegexHirNode::CounterInstance { counter });
-                    self.node2hir(node);
-                    self.postfix
-                        .push(RegexHirNode::CounterIncrement { counter, min, max });
-                    self.postfix.push(RegexHirNode::Catenate);*/
                 } else {
-                    // self.postfix.push(RegexHirNode::Noop);
-                    todo!()
+                    todo!("min == 0 repetitions not yet supported")
                 }
             }
             RegexAst::Char(c) => {
@@ -381,57 +489,41 @@ impl RegexBuilder {
         }
     }
 
-    fn ast2hir(&mut self, root: &RegexAst) {
-        self.postfix.clear();
-        self.node2hir(root);
-    }
+    // -- Low-level NFA construction helpers ----------------------------------
 
+    /// Push a new NFA state and return its index.
     fn state(&mut self, state: State) -> usize {
         let idx = self.states.len();
         self.states.push(state);
         idx
     }
 
+    /// Walk the linked list of dangling `out` pointers starting at `list`
+    /// and patch each one to point to `idx`.
     fn patch(&mut self, mut list: usize, idx: usize) {
         while let Some(state) = self.states.get_mut(list) {
             list = match state {
-                State::Char { out, .. } => {
+                State::Char { out, .. }
+                | State::Wildcard { out, .. }
+                | State::CounterInstance { out, .. }
+                | State::Noop { out, .. } => {
                     let next = *out;
                     *out = idx;
                     next
                 }
-                State::Split { out1, .. } => {
+                State::Split { out1, .. } | State::CounterIncrement { out1, .. } => {
                     let next = *out1;
                     *out1 = idx;
                     next
                 }
-                State::Wildcard { out } => {
-                    let next = *out;
-                    *out = idx;
-                    next
-                }
-                State::CounterInstance { out, .. } => {
-                    let next = *out;
-                    *out = idx;
-                    next
-                }
-                State::CounterIncrement { out1, .. } => {
-                    let next = *out1;
-                    *out1 = idx;
-                    next
-                }
-                State::Noop { out, .. } => {
-                    let next = *out;
-                    *out = idx;
-                    next
-                }
-                _ => panic!("Invalid state: {:?}", state),
+                _ => panic!("patch: unexpected state {:?}", state),
             };
         }
     }
 
+    /// Append `list2` to the end of the dangling-pointer chain starting at
+    /// `list1`.
     fn append(&mut self, list1: usize, list2: usize) -> usize {
-        let oldlist1 = list1;
         let len = self.states.len();
         let mut s = &mut self.states[list1];
         let mut next = s.next();
@@ -440,9 +532,11 @@ impl RegexBuilder {
             next = s.next();
         }
         s.append(list2);
-        oldlist1
+        list1
     }
 
+    /// Consume one postfix HIR node and return the corresponding NFA
+    /// fragment.
     #[inline]
     fn next_fragment(&mut self, node: RegexHirNode) -> Fragment {
         match node {
@@ -465,7 +559,7 @@ impl RegexBuilder {
                 let e = self.frags.pop().unwrap();
                 let s = self.state(State::Split {
                     out: e.start,
-                    out1: INVALID_INDEX,
+                    out1: DANGLING,
                 });
                 Fragment::new(s, self.append(e.out, s))
             }
@@ -473,7 +567,7 @@ impl RegexBuilder {
                 let e = self.frags.pop().unwrap();
                 let s = self.state(State::Split {
                     out: e.start,
-                    out1: INVALID_INDEX,
+                    out1: DANGLING,
                 });
                 self.patch(e.out, s);
                 Fragment::new(s, s)
@@ -482,7 +576,7 @@ impl RegexBuilder {
                 let e = self.frags.pop().unwrap();
                 let s = self.state(State::Split {
                     out: e.start,
-                    out1: INVALID_INDEX,
+                    out1: DANGLING,
                 });
                 self.patch(e.out, s);
                 Fragment::new(e.start, s)
@@ -491,7 +585,7 @@ impl RegexBuilder {
                 let e = self.frags.pop().unwrap();
                 let s = self.state(State::CounterInstance {
                     counter,
-                    out: INVALID_INDEX,
+                    out: DANGLING,
                 });
                 self.patch(e.out, s);
                 Fragment::new(e.start, s)
@@ -500,7 +594,7 @@ impl RegexBuilder {
                 let e = self.frags.pop().unwrap();
                 let s = self.state(State::CounterIncrement {
                     out: e.start,
-                    out1: INVALID_INDEX,
+                    out1: DANGLING,
                     min,
                     max,
                     counter,
@@ -509,38 +603,42 @@ impl RegexBuilder {
                 Fragment::new(s, s)
             }
             RegexHirNode::Wildcard => {
-                let idx = self.state(State::Wildcard { out: INVALID_INDEX });
+                let idx = self.state(State::Wildcard { out: DANGLING });
                 Fragment::new(idx, idx)
             }
             RegexHirNode::Char(char) => {
                 let idx = self.state(State::Char {
                     char,
-                    out: INVALID_INDEX,
+                    out: DANGLING,
                 });
                 Fragment::new(idx, idx)
             }
             RegexHirNode::Noop => {
-                let idx = self.state(State::Noop { out: INVALID_INDEX });
+                let idx = self.state(State::Noop { out: DANGLING });
                 Fragment::new(idx, idx)
             }
         }
     }
 
+    /// Compile an AST into a ready-to-match [`Regex`].
     pub fn build(&mut self, ast: &RegexAst) -> Regex {
         self.states.clear();
         self.frags.clear();
-        self.ast2hir(ast);
-        println!("postfix: {:#?}", self.postfix);
+        self.postfix.clear();
+        self.node2hir(ast);
+
         let mut postfix = std::mem::take(&mut self.postfix);
         for node in postfix.drain(..) {
             let frag = self.next_fragment(node);
-            self.frags.push(frag)
+            self.frags.push(frag);
         }
         self.postfix = postfix;
+
         let e = self.frags.pop().unwrap();
         assert!(self.frags.is_empty());
         let s = self.state(State::Match);
         self.patch(e.out, s);
+
         Regex {
             states: StateList(self.states.to_vec().into_boxed_slice()),
             start: e.start,
@@ -549,38 +647,27 @@ impl RegexBuilder {
     }
 }
 
-#[derive(Debug, Default)]
-struct MatcherMemory {
-    lastlist: Vec<usize>,
-    counters: Vec<Option<Counter>>,
-    clist: Vec<usize>,
-    nlist: Vec<usize>,
-}
+// ---------------------------------------------------------------------------
+// Multi-instance counter (Becchi differential representation)
+// ---------------------------------------------------------------------------
 
-impl MatcherMemory {
-    fn matcher<'a>(&'a mut self, regex: &'a Regex) -> Matcher<'a> {
-        self.lastlist.clear();
-        self.lastlist.resize(regex.states.len(), usize::MAX);
-        self.counters.clear();
-        self.counters.resize(regex.counters.len(), None);
-        self.clist.clear();
-        self.nlist.clear();
-
-        let mut m = Matcher {
-            counters: &mut self.counters,
-            states: &regex.states,
-            lastlist: &mut self.lastlist,
-            listid: 0,
-            clist: &mut self.clist,
-            nlist: &mut self.nlist,
-        };
-
-        m.startlist(regex.start);
-
-        m
-    }
-}
-
+/// A multi-instance counter using the differential representation from
+/// the Becchi paper.
+///
+/// Multiple overlapping occurrences of a counted sub-expression can be
+/// tracked simultaneously.  All instances are incremented in parallel,
+/// and the oldest instance is always the one with the highest `value`.
+///
+/// # Fields
+///
+/// - `value` — the oldest (highest) instance's value.
+/// - `delta` — how much the newest instance has accumulated since the
+///   last [`push`](Self::push).
+/// - `deltas` — FIFO of deltas for intermediate instances (oldest at
+///   front).
+/// - `incremented` — set by [`incr`](Self::incr), cleared at each
+///   simulation step; used to prevent a `CounterIncrement` state from
+///   being processed twice in the same epsilon closure.
 #[derive(Clone, Debug)]
 struct Counter {
     incremented: bool,
@@ -589,21 +676,35 @@ struct Counter {
     deltas: VecDeque<usize>,
 }
 
+impl Default for Counter {
+    fn default() -> Self {
+        Self {
+            incremented: false,
+            value: 0,
+            delta: 0,
+            deltas: VecDeque::default(),
+        }
+    }
+}
+
 impl Counter {
+    /// Push (allocate) a new instance.  The current `delta` is saved and
+    /// reset to zero.
     fn push(&mut self) {
         assert!(self.delta > 0);
         self.deltas.push_back(self.delta);
         self.delta = 0;
     }
 
+    /// Increment all instances by 1.
     fn incr(&mut self) {
         self.value += 1;
         self.delta += 1;
         self.incremented = true;
     }
 
-    // Return true is if the counter has no instances left
-    // false otherwise.
+    /// De-allocate the oldest instance.  Returns `true` if the counter
+    /// has no instances left (should be set to `None`).
     fn pop(&mut self) -> bool {
         assert!(self.value > 0);
         if let Some(delta) = self.deltas.pop_front() {
@@ -617,28 +718,80 @@ impl Counter {
     }
 }
 
-impl Default for Counter {
-    fn default() -> Self {
-        Self {
-            incremented: false,
-            value: 0,
-            delta: 0,
-            deltas: VecDeque::default(),
-        }
+// ---------------------------------------------------------------------------
+// Matcher (NFA simulation)
+// ---------------------------------------------------------------------------
+
+/// Reusable memory for [`Matcher`].  Create once, call
+/// [`matcher`](Self::matcher) for each regex to match.
+#[derive(Debug, Default)]
+struct MatcherMemory {
+    /// Per-state: the `listid` when the state was last added.  Used for
+    /// O(1) deduplication in `addstate`.
+    lastlist: Vec<usize>,
+    /// One slot per counter variable.
+    counters: Vec<Option<Counter>>,
+    /// Current and next state lists (swapped each step).
+    clist: Vec<usize>,
+    nlist: Vec<usize>,
+    /// Per-state snapshot of `ci_gen` at first visit in the current step.
+    /// See the module-level doc comment for the motivation.
+    ci_gen_at_visit: Vec<usize>,
+}
+
+impl MatcherMemory {
+    fn matcher<'a>(&'a mut self, regex: &'a Regex) -> Matcher<'a> {
+        self.lastlist.clear();
+        self.lastlist.resize(regex.states.len(), usize::MAX);
+        self.counters.clear();
+        self.counters.resize(regex.counters.len(), None);
+        self.clist.clear();
+        self.nlist.clear();
+        self.ci_gen_at_visit.clear();
+        self.ci_gen_at_visit.resize(regex.states.len(), 0);
+
+        let mut m = Matcher {
+            counters: &mut self.counters,
+            states: &regex.states,
+            lastlist: &mut self.lastlist,
+            listid: 0,
+            clist: &mut self.clist,
+            nlist: &mut self.nlist,
+            ci_gen: 0,
+            ci_gen_at_visit: &mut self.ci_gen_at_visit,
+        };
+
+        m.startlist(regex.start);
+        m
     }
 }
+
+/// Runs a Thompson NFA simulation with counting-constraint support.
 #[derive(Debug)]
 struct Matcher<'a> {
     counters: &'a mut [Option<Counter>],
     states: &'a [State],
+    /// Per-state deduplication stamp (compared against `listid`).
     lastlist: &'a mut [usize],
+    /// Monotonically increasing step ID.
     listid: usize,
+    /// Current active state list.
     clist: &'a mut Vec<usize>,
+    /// Next active state list (built during a step).
     nlist: &'a mut Vec<usize>,
+    /// Monotonically increasing generation counter; incremented every
+    /// time [`addcounter`](Self::addcounter) is called.  Used together
+    /// with `ci_gen_at_visit` to detect whether a `CounterInstance`
+    /// fired between the first visit and a re-entry at a
+    /// `CounterIncrement` state.
+    ci_gen: usize,
+    /// Per-state snapshot of `ci_gen` recorded on first visit.
+    ci_gen_at_visit: &'a mut [usize],
 }
 
 impl<'a> Matcher<'a> {
-    /// Compute initial state list.
+    /// Compute the initial state list by following all epsilon transitions
+    /// from `start`.
     #[inline]
     fn startlist(&mut self, start: usize) {
         self.addstate(start);
@@ -646,184 +799,254 @@ impl<'a> Matcher<'a> {
         self.listid += 1;
     }
 
+    /// Allocate (or push) a counter instance.  If the counter is `None`
+    /// (not yet created or previously exhausted), a fresh default counter
+    /// is created.  Otherwise a new instance is pushed onto the existing
+    /// counter.
+    ///
+    /// Increments `ci_gen` so that downstream `CounterIncrement` re-entry
+    /// checks can detect that a new instance was allocated.
     fn addcounter(&mut self, idx: usize) {
-        println!(
-            "ADDING INSTANCE FOR COUNTER {} = {:#?}",
-            idx, self.counters[idx]
-        );
         if let Some(counter) = self.counters[idx].as_mut() {
             counter.push();
         } else {
             self.counters[idx] = Some(Counter::default());
         }
+        self.ci_gen += 1;
     }
 
+    /// Increment all instances of counter `idx`.
     fn inccounter(&mut self, idx: usize) {
-        println!(
-            "INCREMENTING VALUE FOR COUNTER {} = {:#?}",
-            idx, self.counters[idx]
-        );
         self.counters[idx].as_mut().unwrap().incr();
     }
 
+    /// De-allocate the oldest instance of counter `idx`.  If no instances
+    /// remain, the counter is set to `None`.
     fn delcounter(&mut self, idx: usize) {
-        println!(
-            "DELETING INSTANCE FOR COUNTER {} = {:#?}",
-            idx, self.counters[idx]
-        );
         if self.counters[idx].as_mut().unwrap().pop() {
             self.counters[idx] = None;
         }
     }
 
+    /// Returns `true` if a `CounterIncrement` for `counter` should be
+    /// allowed to proceed.
+    ///
+    /// The counter is processable when:
+    /// - It is `Some` and has not yet been incremented in this epsilon
+    ///   closure pass (`!incremented`), OR
+    /// - It is `None` (exhausted) and a `CounterInstance` fired since
+    ///   this state's first visit in the current step (`ci_gen` advanced).
+    fn counter_is_processable(&self, counter: usize, state_idx: usize) -> bool {
+        self.counters[counter]
+            .as_ref()
+            .map_or(self.ci_gen > self.ci_gen_at_visit[state_idx], |c| {
+                !c.incremented
+            })
+    }
+
+    /// Recursively follow epsilon transitions from state `idx`, adding
+    /// all reachable states to `nlist`.
+    ///
+    /// This is the heart of the Thompson NFA simulation.  The
+    /// `lastlist`/`listid` mechanism provides O(1) deduplication so each
+    /// state is visited at most once per step (with a controlled exception
+    /// for `CounterIncrement` re-entry — see below).
+    ///
+    /// ## CounterIncrement re-entry
+    ///
+    /// Normally each state is visited at most once.  However, a
+    /// `CounterIncrement` state may need to be re-visited when a new
+    /// counter instance arrives via a different path in the same epsilon
+    /// closure.  Re-entry is allowed when
+    /// [`counter_is_processable`](Self::counter_is_processable) returns
+    /// `true`.
+    ///
+    /// ## Epsilon-body detection
+    ///
+    /// If the repetition body can match the empty string (e.g. `(a?)`),
+    /// the continue path's epsilon closure will loop back to this same
+    /// `CounterIncrement` state.  We detect this by temporarily clearing
+    /// our `lastlist` mark before following the continue path: if the
+    /// epsilon closure re-marks us, the body is epsilon-matchable.  In
+    /// that case, the break condition is relaxed: since epsilon matches
+    /// can advance the counter for free, any value in `[min, max]` is
+    /// reachable and we always allow the break.
     #[inline]
     fn addstate(&mut self, idx: usize) {
-        println!("[addstate] idx = {}, lastid = {}", idx, self.listid);
         if self.lastlist[idx] == self.listid {
-            println!("[addstate] skipping");
-            return;
+            let should_reenter = match self.states[idx] {
+                State::CounterIncrement { counter, .. } => {
+                    self.counter_is_processable(counter, idx)
+                }
+                _ => false,
+            };
+            if !should_reenter {
+                return;
+            }
+        }
+
+        // Record ci_gen only on first visit so re-entry compares against
+        // the original snapshot.
+        if self.lastlist[idx] != self.listid {
+            self.ci_gen_at_visit[idx] = self.ci_gen;
         }
         self.lastlist[idx] = self.listid;
+
         match self.states[idx] {
             State::Split { out, out1 } => {
                 self.addstate(out);
                 self.addstate(out1);
             }
+
             State::CounterInstance { out, counter } => {
                 self.addcounter(counter);
                 self.addstate(out);
             }
+
             State::CounterIncrement {
                 out,
                 out1,
                 counter,
                 min,
                 max,
-            } if self.counters[counter]
-                .as_ref()
-                .is_some_and(|c| !c.incremented) =>
-            {
+            } if self.counter_is_processable(counter, idx) => {
+                // Re-create the counter if it was exhausted (None).  This
+                // only happens when ci_gen advanced (i.e. a CounterInstance
+                // for an inner counter fired since our first visit).
+                if self.counters[counter].is_none() {
+                    self.counters[counter] = Some(Counter::default());
+                }
+
                 self.inccounter(counter);
                 let value = self.counters[counter].as_ref().unwrap().value;
-                assert!(value > 0);
-                assert!(value <= max);
+                debug_assert!(value > 0 && value <= max);
                 let is_single = self.counters[counter].as_ref().unwrap().deltas.is_empty();
 
-                // Follow the continue path to add the body's character-consuming
-                // states.  Temporarily clear our lastlist mark so we can detect
-                // whether the body's epsilon closure reaches back to this
-                // CounterIncrement.  The `incremented` flag remains true (from
-                // inccounter above), so the recursive addstate will NOT re-process
-                // this state — it will just set lastlist[idx] = listid and fall
-                // through to `_ => {}`.
+                // -- Continue path --
+                // Follow the body again unless the single remaining
+                // instance has reached max.
                 let should_continue = value != max || !is_single;
                 let mut is_epsilon_body = false;
                 if should_continue {
+                    // Temporarily clear our mark to detect epsilon-body
+                    // loops.  The `incremented` flag (set by inccounter)
+                    // prevents the recursive call from re-processing this
+                    // state — it just sets lastlist[idx] and falls through.
                     self.lastlist[idx] = self.listid.wrapping_sub(1);
-                    println!("[addstate] continue for counter {}", counter);
                     self.addstate(out);
-                    // Check if the epsilon closure reached back to us.
                     is_epsilon_body = self.lastlist[idx] == self.listid;
-                    // Ensure we're marked as visited regardless.
                     self.lastlist[idx] = self.listid;
                 }
 
-                // Evaluate break condition.  For epsilon-matchable bodies, the
-                // repetition can freely match empty any number of times, so any
-                // counter value from the current up to `max` is reachable.  We
-                // check if the range [value, max] intersects [min, max].  For
-                // non-epsilon bodies, check all current counter instances.
+                // -- Break condition --
+                // For epsilon bodies the counter can freely advance to any
+                // value in [value, max] via empty matches, so the break
+                // condition is always satisfiable when min <= max (which
+                // is an invariant).  For normal bodies, check all current
+                // counter instances against [min, max].
                 let stop = if is_epsilon_body {
-                    // [value, max] ∩ [min, max] is non-empty iff value <= max && min <= max
-                    // (both of which are invariants), so this is always true when min <= max.
                     min <= max
                 } else {
                     let cnt = self.counters[counter].as_ref().unwrap();
                     let mut val = cnt.value;
-                    let mut s = val >= min && val <= max;
+                    let mut ok = val >= min && val <= max;
                     for delta in &cnt.deltas {
                         val -= delta;
-                        s = s || (val >= min && val <= max)
+                        ok = ok || (val >= min && val <= max);
                     }
-                    s
+                    ok
                 };
 
+                // De-allocate the oldest instance if it reached max.
                 if value == max {
                     self.delcounter(counter);
                 }
 
+                // Follow the break path if any instance satisfies the
+                // counting constraint.
                 if stop {
-                    println!("[addstate] break for counter {}", counter);
                     self.addstate(out1);
                 }
             }
+
             State::Noop { out } => {
                 self.addstate(out);
             }
+
+            // Char, Wildcard, Match, or CounterIncrement whose guard
+            // failed — just record the state for step() to inspect.
             _ => {}
         }
+
         self.nlist.push(idx);
     }
 
+    /// Advance the simulation by one input character.
+    ///
+    /// For each state in `clist`, if the character matches (`Char` or
+    /// `Wildcard`), follow the `out` pointer through `addstate` to build
+    /// the next `nlist`.
     fn step(&mut self, c: char) {
         self.nlist.clear();
         let clist = std::mem::take(self.clist);
-        println!(
-            "c: {}, list = {:?}, counters = {:#?}",
-            c, clist, self.counters
-        );
+
+        // Reset the per-step `incremented` flag on every active counter
+        // so that CounterIncrement states can be processed in the new
+        // epsilon closure.
         for counter in self.counters.iter_mut().filter_map(|c| c.as_mut()) {
             counter.incremented = false;
         }
+
         for &idx in &clist {
-            println!("states[{}]: {:?}", idx, self.states[idx]);
             match self.states[idx] {
-                State::Char { char: c2, out } if c == c2 => {
-                    self.addstate(out);
-                }
-                State::Wildcard { out } => {
-                    self.addstate(out);
-                }
+                State::Char { char: c2, out } if c == c2 => self.addstate(out),
+                State::Wildcard { out } => self.addstate(out),
                 _ => {}
             }
         }
+
         *self.clist = std::mem::replace(self.nlist, clist);
         self.listid += 1;
     }
 
+    /// Feed an entire input string through the matcher, one character at
+    /// a time.
     fn chunk(&mut self, input: &str) {
-        println!("[chunk] input = {}", input);
         for c in input.chars() {
             self.step(c);
         }
     }
 
-    /// Check whether state list contains a match.
+    /// Check whether the current state list contains a `Match` state.
     pub fn ismatch(&self) -> bool {
-        println!("list = {:?}, counters = {:?}", self.clist, self.counters);
-        for &idx in self.clist.iter() {
-            if matches!(self.states[idx], State::Match) {
-                return true;
-            }
-        }
-
-        false
+        self.clist
+            .iter()
+            .any(|&idx| matches!(self.states[idx], State::Match))
     }
 }
 
+// ---------------------------------------------------------------------------
+// Entry point (unused — this crate is test-driven)
+// ---------------------------------------------------------------------------
+
 fn main() {}
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
 
-    /// Build an anchored regex pattern string from the AST for use with the `regex` crate.
+    /// Build an anchored regex pattern string from the AST for use with
+    /// the `regex` crate (source of truth).
     fn anchored_pattern(ast: &RegexAst) -> String {
         format!("^{}$", ast)
     }
 
     /// Assert that our NFA matcher and the `regex` crate agree on whether
-    /// `input` matches the given AST. Panics with a descriptive message on mismatch.
+    /// `input` matches the given AST.
     fn assert_matches_regex_crate(ast: &RegexAst, input: &str) {
         let pattern = anchored_pattern(ast);
         let re = regex::Regex::new(&pattern).expect("regex crate should parse pattern");
@@ -838,11 +1061,12 @@ pub(crate) mod tests {
 
         assert_eq!(
             actual, expected,
-            "mismatch for pattern `{}` on input {:?}: our NFA returned {}, regex crate returned {}",
+            "mismatch for pattern `{}` on input {:?}: ours={}, regex crate={}",
             pattern, input, actual, expected
         );
     }
 
+    /// `(a|bc){1,2}` — used by several tests.
     fn range_regex() -> RegexAst {
         RegexAst::Repetition {
             node: Box::new(RegexAst::Alternate(vec![
@@ -854,6 +1078,7 @@ pub(crate) mod tests {
         }
     }
 
+    /// `.*a.{3}bc` — counting constraint on a wildcard.
     #[test]
     fn test_counting() {
         let ast = RegexAst::Catenate(vec![
@@ -875,16 +1100,14 @@ pub(crate) mod tests {
         assert_matches_regex_crate(&ast, "a123bc");
     }
 
+    /// `(a|bc){1,2}` — flat range repetition with all combos up to 3.
     #[test]
     fn test_range() {
         use itertools::Itertools;
 
         let ast = range_regex();
 
-        // Non-matching
         assert_matches_regex_crate(&ast, "");
-
-        // Single repetition
         assert_matches_regex_crate(&ast, "a");
         assert_matches_regex_crate(&ast, "bc");
 
@@ -909,6 +1132,7 @@ pub(crate) mod tests {
         }
     }
 
+    /// `((a|bc){1,2}){2,3}` — nested counting constraints.
     #[test]
     fn test_nested_counting() {
         use itertools::Itertools;
@@ -944,6 +1168,8 @@ pub(crate) mod tests {
         }
     }
 
+    /// `(a|a?){2,3}` — epsilon-matchable body (the `a?` branch can match
+    /// empty).  Exercises the epsilon-body detection logic in `addstate`.
     #[test]
     fn test_aaaaa() {
         let ast = RegexAst::Repetition {
