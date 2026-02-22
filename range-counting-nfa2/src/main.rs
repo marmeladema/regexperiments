@@ -119,10 +119,10 @@ impl fmt::Display for RegexAst {
                 }
                 match (min, max) {
                     (Some(n), Some(m)) if n == m => write!(f, "{{{}}}", n),
-                    (None | Some(0), Some(m)) => write!(f, "{{,{}}}", m),
+                    (None, Some(m)) => write!(f, "{{0,{}}}", m),
                     (Some(n), None) => write!(f, "{{{},}}", n),
                     (Some(n), Some(m)) => write!(f, "{{{},{}}}", n, m),
-                    (None, None) => write!(f, "{{,}}"),
+                    (None, None) => write!(f, "{{0,}}"),
                 }
             }
             Self::Char(c) => write!(f, "{}", c),
@@ -167,7 +167,7 @@ impl fmt::Display for RegexAst {
 
 /// A single NFA state.
 ///
-/// Epsilon states (`Split`, `CounterInstance`, `CounterIncrement`, `Noop`)
+/// Epsilon states (`Split`, `CounterInstance`, `CounterIncrement`)
 /// are followed during [`Matcher::addstate`].  Character-consuming states
 /// (`Char`, `Wildcard`) are stepped over in [`Matcher::step`].
 #[derive(Clone, Copy, Debug)]
@@ -200,9 +200,6 @@ enum State {
     /// Match any character, then follow `out`.
     Wildcard { out: usize },
 
-    /// Unconditional epsilon transition (placeholder).
-    Noop { out: usize },
-
     /// Accepting state.
     Match,
 }
@@ -214,8 +211,7 @@ impl State {
         match self {
             State::Char { out, .. }
             | State::Wildcard { out, .. }
-            | State::CounterInstance { out, .. }
-            | State::Noop { out } => out,
+            | State::CounterInstance { out, .. } => out,
             State::Split { out1, .. } | State::CounterIncrement { out1, .. } => out1,
             _ => unreachable!(),
         }
@@ -226,8 +222,7 @@ impl State {
         match self {
             State::Char { out, .. }
             | State::Wildcard { out, .. }
-            | State::CounterInstance { out, .. }
-            | State::Noop { out } => *out = next,
+            | State::CounterInstance { out, .. } => *out = next,
             State::Split { out1, .. } | State::CounterIncrement { out1, .. } => *out1 = next,
             _ => unreachable!(),
         }
@@ -275,7 +270,6 @@ enum RegexHirNode {
         min: usize,
         max: usize,
     },
-    Noop,
 }
 
 // ---------------------------------------------------------------------------
@@ -370,7 +364,6 @@ impl Regex {
             State::Match => {
                 writeln!(buffer, "\t{} [peripheries=2];", idx).unwrap();
             }
-            State::Noop { .. } => {}
         }
     }
 }
@@ -492,8 +485,59 @@ impl RegexBuilder {
                     self.postfix
                         .push(RegexHirNode::CounterIncrement { counter, min, max });
                     self.postfix.push(RegexHirNode::Catenate);
+                } else if max == usize::MAX {
+                    // {0,} is just ZeroPlus — no counter overhead needed.
+                    self.node2hir(node);
+                    self.postfix.push(RegexHirNode::RepeatZeroPlus);
                 } else {
-                    todo!("min == 0 repetitions not yet supported")
+                    // {0,max}: lower to (body{1,max})? — the `?` wrapping
+                    // the entire counted construct provides the zero-match
+                    // path without polluting the body with an epsilon
+                    // alternative (which would confuse nested counters).
+                    let counter = self.next_counter();
+
+                    let start = self.postfix.len();
+                    self.node2hir(node);
+                    let end = self.postfix.len();
+
+                    self.postfix.push(RegexHirNode::CounterInstance { counter });
+
+                    let body = self.postfix[start..end].to_vec();
+                    let mut counter_map = std::collections::HashMap::new();
+                    for hir_node in body {
+                        let remapped = match hir_node {
+                            RegexHirNode::CounterInstance { counter: c } => {
+                                let new_c =
+                                    *counter_map.entry(c).or_insert_with(|| self.next_counter());
+                                RegexHirNode::CounterInstance { counter: new_c }
+                            }
+                            RegexHirNode::CounterIncrement {
+                                counter: c,
+                                min: mn,
+                                max: mx,
+                            } => {
+                                let new_c =
+                                    *counter_map.entry(c).or_insert_with(|| self.next_counter());
+                                RegexHirNode::CounterIncrement {
+                                    counter: new_c,
+                                    min: mn,
+                                    max: mx,
+                                }
+                            }
+                            other => other,
+                        };
+                        self.postfix.push(remapped);
+                    }
+
+                    self.postfix.push(RegexHirNode::CounterIncrement {
+                        counter,
+                        min: 1,
+                        max,
+                    });
+                    self.postfix.push(RegexHirNode::Catenate);
+
+                    // Wrap in `?` to provide the zero-match path.
+                    self.postfix.push(RegexHirNode::RepeatZeroOne);
                 }
             }
             RegexAst::Char(c) => {
@@ -521,8 +565,7 @@ impl RegexBuilder {
             list = match state {
                 State::Char { out, .. }
                 | State::Wildcard { out, .. }
-                | State::CounterInstance { out, .. }
-                | State::Noop { out, .. } => {
+                | State::CounterInstance { out, .. } => {
                     let next = *out;
                     *out = idx;
                     next
@@ -627,10 +670,6 @@ impl RegexBuilder {
                     char,
                     out: DANGLING,
                 });
-                Fragment::new(idx, idx)
-            }
-            RegexHirNode::Noop => {
-                let idx = self.state(State::Noop { out: DANGLING });
                 Fragment::new(idx, idx)
             }
         }
@@ -983,10 +1022,6 @@ impl<'a> Matcher<'a> {
                 if stop {
                     self.addstate(out1);
                 }
-            }
-
-            State::Noop { out } => {
-                self.addstate(out);
             }
 
             // Char, Wildcard, Match, or CounterIncrement whose guard
@@ -1427,5 +1462,204 @@ mod tests {
         assert_matches_regex_crate(&ast, "abbabbbabb");
         assert_matches_regex_crate(&ast, "aabbaabbb");
         assert_matches_regex_crate(&ast, "aabbbaabbb");
+    }
+
+    // -- min=0 repetition tests ---------------------------------------------
+
+    /// `a{0,2}` — zero to two occurrences of a single char.
+    #[test]
+    fn test_min_zero_basic() {
+        let ast = RegexAst::Repetition {
+            node: Box::new(RegexAst::Char('a')),
+            min: Some(0),
+            max: Some(2),
+        };
+
+        assert_matches_regex_crate(&ast, "");
+        assert_matches_regex_crate(&ast, "a");
+        assert_matches_regex_crate(&ast, "aa");
+        assert_matches_regex_crate(&ast, "aaa");
+        assert_matches_regex_crate(&ast, "b");
+    }
+
+    /// `a{0,1}` — equivalent to `a?`.
+    #[test]
+    fn test_min_zero_max_one() {
+        let ast = RegexAst::Repetition {
+            node: Box::new(RegexAst::Char('a')),
+            min: Some(0),
+            max: Some(1),
+        };
+
+        assert_matches_regex_crate(&ast, "");
+        assert_matches_regex_crate(&ast, "a");
+        assert_matches_regex_crate(&ast, "aa");
+        assert_matches_regex_crate(&ast, "b");
+    }
+
+    /// `(a|bc){0,3}` — zero to three of an alternation.
+    #[test]
+    fn test_min_zero_alternation() {
+        use itertools::Itertools;
+
+        let ast = RegexAst::Repetition {
+            node: Box::new(RegexAst::Alternate(vec![
+                RegexAst::Catenate(vec![RegexAst::Char('a')]),
+                RegexAst::Catenate(vec![RegexAst::Char('b'), RegexAst::Char('c')]),
+            ])),
+            min: Some(0),
+            max: Some(3),
+        };
+
+        assert_matches_regex_crate(&ast, "");
+        assert_matches_regex_crate(&ast, "a");
+        assert_matches_regex_crate(&ast, "bc");
+        assert_matches_regex_crate(&ast, "b");
+
+        for i in 2..=4 {
+            for v in std::iter::repeat(["a", "bc"])
+                .take(i)
+                .map(|a| a.into_iter())
+                .multi_cartesian_product()
+            {
+                let input = v.into_iter().collect::<String>();
+                assert_matches_regex_crate(&ast, &input);
+            }
+        }
+    }
+
+    /// `a{0,}` — zero or more, lowered to `a*` (no counter overhead).
+    #[test]
+    fn test_min_zero_unbounded() {
+        let ast = RegexAst::Repetition {
+            node: Box::new(RegexAst::Char('a')),
+            min: Some(0),
+            max: None,
+        };
+
+        assert_matches_regex_crate(&ast, "");
+        assert_matches_regex_crate(&ast, "a");
+        assert_matches_regex_crate(&ast, "aa");
+        assert_matches_regex_crate(&ast, "aaa");
+        assert_matches_regex_crate(&ast, "aaaa");
+        assert_matches_regex_crate(&ast, "b");
+    }
+
+    /// `(ab){0,}` — zero or more of a group, lowered to `(ab)*`.
+    #[test]
+    fn test_min_zero_unbounded_group() {
+        let ast = RegexAst::Repetition {
+            node: Box::new(RegexAst::Catenate(vec![
+                RegexAst::Char('a'),
+                RegexAst::Char('b'),
+            ])),
+            min: Some(0),
+            max: None,
+        };
+
+        assert_matches_regex_crate(&ast, "");
+        assert_matches_regex_crate(&ast, "a");
+        assert_matches_regex_crate(&ast, "ab");
+        assert_matches_regex_crate(&ast, "abab");
+        assert_matches_regex_crate(&ast, "ababab");
+        assert_matches_regex_crate(&ast, "aba");
+    }
+
+    /// `x(a{0,2})+y` — min=0 repetition nested inside `+`.
+    #[test]
+    fn test_min_zero_inside_one_plus() {
+        let ast = RegexAst::Catenate(vec![
+            RegexAst::Char('x'),
+            RegexAst::OnePlus(Box::new(RegexAst::Repetition {
+                node: Box::new(RegexAst::Char('a')),
+                min: Some(0),
+                max: Some(2),
+            })),
+            RegexAst::Char('y'),
+        ]);
+
+        assert_matches_regex_crate(&ast, "xy");
+        assert_matches_regex_crate(&ast, "xay");
+        assert_matches_regex_crate(&ast, "xaay");
+        assert_matches_regex_crate(&ast, "xaaay");
+        assert_matches_regex_crate(&ast, "xaaaay");
+        assert_matches_regex_crate(&ast, "x");
+        assert_matches_regex_crate(&ast, "y");
+        assert_matches_regex_crate(&ast, "");
+    }
+
+    /// `(a{0,2}){2,3}` — min=0 inner, counted outer.
+    #[test]
+    fn test_min_zero_inside_repetition() {
+        let ast = RegexAst::Repetition {
+            node: Box::new(RegexAst::Repetition {
+                node: Box::new(RegexAst::Char('a')),
+                min: Some(0),
+                max: Some(2),
+            }),
+            min: Some(2),
+            max: Some(3),
+        };
+
+        assert_matches_regex_crate(&ast, "");
+        assert_matches_regex_crate(&ast, "a");
+        assert_matches_regex_crate(&ast, "aa");
+        assert_matches_regex_crate(&ast, "aaa");
+        assert_matches_regex_crate(&ast, "aaaa");
+        assert_matches_regex_crate(&ast, "aaaaa");
+        assert_matches_regex_crate(&ast, "aaaaaa");
+        assert_matches_regex_crate(&ast, "aaaaaaa");
+        assert_matches_regex_crate(&ast, "b");
+    }
+
+    /// `(a+){0,3}` — `+` inside a min=0 counted repetition.
+    #[test]
+    fn test_one_plus_inside_min_zero_repetition() {
+        let ast = RegexAst::Repetition {
+            node: Box::new(RegexAst::OnePlus(Box::new(RegexAst::Char('a')))),
+            min: Some(0),
+            max: Some(3),
+        };
+
+        assert_matches_regex_crate(&ast, "");
+        assert_matches_regex_crate(&ast, "a");
+        assert_matches_regex_crate(&ast, "aa");
+        assert_matches_regex_crate(&ast, "aaa");
+        assert_matches_regex_crate(&ast, "aaaa");
+        assert_matches_regex_crate(&ast, "aaaaa");
+        assert_matches_regex_crate(&ast, "aaaaaa");
+        assert_matches_regex_crate(&ast, "b");
+    }
+
+    /// `.{0,3}` — min=0 repetition on wildcard.
+    #[test]
+    fn test_min_zero_wildcard() {
+        let ast = RegexAst::Repetition {
+            node: Box::new(RegexAst::Wildcard),
+            min: Some(0),
+            max: Some(3),
+        };
+
+        assert_matches_regex_crate(&ast, "");
+        assert_matches_regex_crate(&ast, "a");
+        assert_matches_regex_crate(&ast, "ab");
+        assert_matches_regex_crate(&ast, "abc");
+        assert_matches_regex_crate(&ast, "abcd");
+    }
+
+    /// `{,3}` (None min) — same as `{0,3}`.
+    #[test]
+    fn test_none_min_repetition() {
+        let ast = RegexAst::Repetition {
+            node: Box::new(RegexAst::Char('a')),
+            min: None,
+            max: Some(3),
+        };
+
+        assert_matches_regex_crate(&ast, "");
+        assert_matches_regex_crate(&ast, "a");
+        assert_matches_regex_crate(&ast, "aa");
+        assert_matches_regex_crate(&ast, "aaa");
+        assert_matches_regex_crate(&ast, "aaaa");
     }
 }
